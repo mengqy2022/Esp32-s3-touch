@@ -1,0 +1,31 @@
+# ESP-IDF generated files
+build/
+managed_components/
+sdkconfig
+sdkconfig.old
+sdkconfig.*.old
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Python / Node caches
+__pycache__/
+*.py[cod]
+node_modules/
+
+# Local data / secrets / temporary transfers
+*.part
+*.tmp
+*.log
+*.bak
+*.ttf
+*.otf
+*.woff
+*.woff2
+.env
+
+# Serial inventory exports and personal backups
+*backup*.csv

@@ -1,0 +1,16 @@
+# 立创商城 BOM 导出示例
+# 在立创商城订单详情页 → 导出BOM → 选择 CSV 格式
+# 文件放入 SD 卡的 BOM_IN 文件夹，然后在设备上：
+#   主菜单 → INVENTORY → IMPORT BOM → APPLY
+# 设备会自动识别这些列名（中英文均可）：
+#   LCSC编号 / LCSC Part# / lcsc
+#   数量 / Quantity / Qty
+#   名称 / Name / Value / 型号
+#   规格 / Spec / Description
+#   封装 / Package / Footprint
+
+LCSC Part#,Quantity,Name,Value,Footprint
+C123456,10,Resistor,10k 1%,0603
+C234567,20,Capacitor,100nF 50V,0603
+C890123,30,Resistor,1k 1%,0603
+C999999,5,New Part,Example 12V,0805

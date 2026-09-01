@@ -1,0 +1,28 @@
+V6 验证说明
+
+已完成：
+1. 仓库 tools/test_parse.py 回归测试通过。
+2. main/vocabulary.c 已用 GCC/Clang 严格语法与警告检查验证新增逻辑。
+3. main/ui.c 已用 LVGL 最小接口桩完成语法检查，新增 Canvas 手写区/事件代码语法通过。
+4. JSON 导入改为后台任务，并提供百分比/转换词数状态。
+5. 进度扫描改为顺序批量读取，减少 SD FAT 随机 fseek。
+6. 进度格式 V1 -> V2 支持自动迁移，保留累计学习/SRS数据。
+7. UTF-8 安全截断 + 中文字形检查 + IPA 可读映射已加入。
+8. DICTATION 新增触屏逐字母手写输入，同时保留键盘模式。
+
+注意：
+当前运行环境没有你的 ESP-IDF Xtensa 完整目标工具链和实际 ILI9341/XPT2046 硬件，
+因此最终 idf.py build / flash / 触屏手写识别手感仍需在你的电脑和设备上确认。
+
+建议首次刷 V6：
+idf.py fullclean
+idf.py build
+idf.py flash monitor
+
+每日计划时间策略：
+- VOCAB LAB 不强制联网，SD 词库和进度可离线使用。
+- 首次使用如果显示 TIME NEEDED，请先连接 Wi-Fi 等待 SNTP。
+- DATE OK / DATE SYNCED：当前日期可信。
+- DATE CACHED：使用上次可信日期；同一天离线学习没问题。
+- 如果设备关机跨过午夜，为保证“明日计划”准确，建议重新联网同步时间。
+- 项目默认时区为 UTC+8（China Standard Time）。

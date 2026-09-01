@@ -1,0 +1,20 @@
+V6.1 构建修复说明
+
+根据实际 ESP-IDF 5.5.4 / GCC 14.2.0 构建日志修复：
+
+1. main/ui.c
+   - format_phonetic_display(): 拆分 if-return 与 out[0] 初始化。
+   - format_cn_display(): 拆分 if-return 与 out[0] 初始化。
+   - on_dict_mode(): 拆分 click_ok() 判断、事件忽略和模式切换。
+   原因：工程启用了 -Werror=all，GCC 的 -Wmisleading-indentation 会被提升为 error。
+
+2. main/vocabulary.c
+   - 删除未被调用的 json_extract_string() 静态函数，清理 -Wunused-function warning。
+
+功能逻辑保持 V6 不变：SD JSON 后台导入、UTF-8/音标显示处理、
+DICTATION 手写区、每日计划/日期持久化等均保留。
+
+建议重新构建：
+idf.py fullclean
+idf.py build
+idf.py flash monitor
