@@ -10,6 +10,7 @@ idf_component_register(
         "net_utils.c"
         "sudoku.c"
         "game2048.c"
+        "flappy.c"
         "inventory.c"
         "file_xfer.c"
         "vocabulary.c"
@@ -19,3 +20,6 @@ idf_component_register(
              esp_wifi esp_netif esp_event spi_flash
              lvgl__lvgl esp_http_client mbedtls json
 )
+
+# Keep source literals deterministic across Windows/Linux hosts.
+target_compile_options(${COMPONENT_LIB} PRIVATE -finput-charset=UTF-8 -fexec-charset=UTF-8)

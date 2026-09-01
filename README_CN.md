@@ -7,3 +7,10 @@
 - [`docs/CHANGELOG.md`](docs/CHANGELOG.md) — 本次修改清单
 - [`docs/VOCABULARY.md`](docs/VOCABULARY.md) — 单词学习 / 默写 / 下载词库
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — 线程、LVGL、SD 与模块关系
+
+## 本版本重点
+
+- SD：启动早期挂载 + 避免 ENOMEM 时反复卸载/重挂载。
+- INVENTORY：精简为 `PRODUCT_NO,MODEL,QTY`，模板已导入本次 4 份物料 CSV。
+- UTF-8：源码、CSV、脚本和 Windows 串口构建环境统一 UTF-8。
+- 详细变更见 [`RELEASE_NOTES_2026-09-01.md`](RELEASE_NOTES_2026-09-01.md)。

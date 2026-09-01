@@ -6,6 +6,7 @@
 #include "sd_monitor.h"
 #include "sudoku.h"
 #include "game2048.h"
+#include "flappy.h"
 #include "wifi_mgr.h"
 #include "vocabulary.h"
 #include "xpt2046.h"
@@ -81,6 +82,16 @@ static lv_obj_t *s_2048_score;
 static lv_obj_t *s_2048_status;
 static lv_point_t s_2048_touch_start;
 static bool s_2048_touch_active;
+
+// FLAPPY state
+static flappy_game_t s_flappy;
+static lv_obj_t *s_flappy_board;
+static lv_obj_t *s_flappy_bird;
+static lv_obj_t *s_flappy_pipe_top[FLAPPY_PIPE_COUNT];
+static lv_obj_t *s_flappy_pipe_bottom[FLAPPY_PIPE_COUNT];
+static lv_obj_t *s_flappy_score;
+static lv_obj_t *s_flappy_status;
+static lv_timer_t *s_flappy_timer;
 static int s_sudoku_puzzle;
 static lv_obj_t *s_sudo_cells[9][9];
 static lv_obj_t *s_sudo_msg;
@@ -91,9 +102,9 @@ static lv_obj_t *s_sudo_msg;
 
 typedef struct {
     lv_obj_t *row;
-    lv_obj_t *spec;
+    lv_obj_t *model;
     lv_obj_t *qty;
-    lv_obj_t *lcsc;
+    lv_obj_t *product_no;
     lv_obj_t *minus;
     lv_obj_t *plus;
     lv_obj_t *del;
@@ -111,7 +122,7 @@ static int s_inv_first_row;
 static inv_hist_t s_inv_hist_cache[INV_HIST_MAX];
 static int s_inv_hist_count;
 static int s_inv_filter;        // 0=ALL, 1=IN(stock), 2=OUT(stock), 3=history
-static char s_inv_query[40];    // search filter for SPEC/LCSC
+static char s_inv_query[40];    // search filter for MODEL/PRODUCT_NO
 static int s_inv_edit_idx;      // item index being quantity-edited (-1 none)
 static lv_obj_t *s_inv_edit_overlay;
 
@@ -134,9 +145,13 @@ static lv_obj_t *s_dict_feedback;
 static lv_obj_t *s_dict_check;
 static bool s_dict_checked;
 
-#define HAND_W 280
-#define HAND_H 100
-#define HAND_MAX_POINTS 256
+#define HAND_W 300
+#define HAND_H 72
+#define HAND_MAX_POINTS 640
+#define HAND_GRID_W 9
+#define HAND_GRID_H 13
+#define HAND_MAX_SEGMENTS 12
+#define HAND_SEG_GAP 5
 #define HAND_BREAK_COORD (-32768)
 static lv_obj_t *s_hand_canvas;
 static lv_obj_t *s_hand_mode_btn;
@@ -145,17 +160,16 @@ static lv_obj_t *s_hand_preview;
 static lv_obj_t *s_hand_add;
 static lv_obj_t *s_hand_clear;
 static lv_obj_t *s_hand_del;
-/* Two-color indexed canvas: keeps handwriting visible while saving ~33 KB DRAM. */
-static uint8_t s_hand_canvas_buf[
-    LV_CANVAS_BUF_SIZE_INDEXED_1BIT(HAND_W, HAND_H)
-];
+/* Handwriting is rendered directly in the pad's draw event.
+ * This avoids indexed-canvas palette issues and keeps RAM usage low. */
 static lv_point_t s_hand_points[HAND_MAX_POINTS];
 static int s_hand_point_count;
 static bool s_hand_pen_down;
-static lv_point_t s_hand_prev;
 static bool s_dict_hand_mode = true;
 static lv_obj_t *s_plan_value;
 static lv_obj_t *s_plan_stats;
+static uint16_t s_plan_edit_target;
+static char s_plan_notice[64];
 static bool s_vocab_reset_armed;
 static vocab_download_state_t s_last_dl_state = (vocab_download_state_t)-1;
 static char s_vocab_home_notice[96];
@@ -181,6 +195,9 @@ static void refresh_menu_bottom(void);
 static void build_sudoku_screen(void);
 static void build_2048_screen(void);
 static void refresh_2048(void);
+static void build_flappy_screen(void);
+static void refresh_flappy(void);
+static void flappy_timer_cb(lv_timer_t *t);
 static void refresh_sudoku_board(void);
 static void build_inventory_screen(void);
 static void refresh_inventory_list(void);
@@ -201,6 +218,12 @@ static void poll_vocab_open_status(void);
 static void hand_clear_pad(void);
 static void hand_draw_event(lv_event_t *e);
 static void hand_clear_event(lv_event_t *e);
+static void hand_add_event(lv_event_t *e);
+static void hand_del_event(lv_event_t *e);
+static void dict_check_event(lv_event_t *e);
+static int hand_recognize_segments(char *out, size_t out_sz, int *avg_confidence);
+static int hand_commit_pad(bool show_feedback);
+static void plan_action_event(lv_event_t *e);
 
 // ---------------- helpers ----------------
 static void style_screen(lv_obj_t *scr)
@@ -334,6 +357,10 @@ static void on_menu_btn(lv_event_t *e)
             game2048_init(&s_game2048);
             lv_port_post_cmd(UI_CMD_SCREEN, SCREEN_2048);
             break;
+        case 8:
+            flappy_init(&s_flappy);
+            lv_port_post_cmd(UI_CMD_SCREEN, SCREEN_FLAPPY);
+            break;
         case 5: {
             // Enter inventory: ensure folders + load stock from SD card.
             inv_ensure_folders();
@@ -448,6 +475,7 @@ static void build_menu_screen(void)
         { "CALIBRATE",  3, lv_color_hex(0xF5A623) },
         { "SUDOKU",     4, lv_color_hex(0xE0556D) },
         { "2048",       7, lv_color_hex(0xF97316) },
+        { "FLAPPY",     8, lv_color_hex(0x38BDF8) },
         { "INVENTORY",  5, lv_color_hex(0x4CAF50) },
         { "VOCAB LAB",  6, lv_color_hex(0x7C3AED) },
         // Extensible: add more modules below; the container scrolls.
@@ -574,7 +602,14 @@ static void refresh_sd_labels(void)
         label_set_text_if_changed(s_sd_banner, "SCANNING...");
         lv_obj_set_style_text_color(s_sd_banner, CLR_WARN, 0);
     } else {
-        label_set_text_if_changed(s_sd_banner, sd_state_text(s->state));
+        const char *banner = sd_state_text(s->state);
+        if ((s->state == SDMON_MOUNT_ERROR || s->state == SDMON_READ_ERROR) &&
+            s->last_err == ESP_ERR_NO_MEM) {
+            banner = "MEMORY BUSY - RETRY";
+        } else if (s->state == SDMON_MOUNT_ERROR) {
+            banner = "CHECK CARD / FAT32";
+        }
+        label_set_text_if_changed(s_sd_banner, banner);
         lv_obj_set_style_text_color(s_sd_banner, state_color(s->state), 0);
     }
 
@@ -603,7 +638,11 @@ static void refresh_sd_labels(void)
     }
     label_set_text_if_changed(s_sd_sample, line);
 
-    snprintf(line, sizeof(line), "BYTES: %u", (unsigned)s->last_read_bytes);
+    if (s->last_err != ESP_OK && s->state != SDMON_IDLE) {
+        snprintf(line, sizeof(line), "ERR: %s", esp_err_to_name(s->last_err));
+    } else {
+        snprintf(line, sizeof(line), "BYTES: %u", (unsigned)s->last_read_bytes);
+    }
     label_set_text_if_changed(s_sd_bytes, line);
 
     if (s_auto) {
@@ -1043,7 +1082,7 @@ static void refresh_sudoku_board(void)
 }
 
 // ---------------- INVENTORY screen ----------------
-// 3-column table (SPEC | QTY | LCSC) with filters, search, qty editing and
+// 3-column table (MODEL | QTY | PRODUCT NO) with filters, search, qty editing and
 // stock history. Stock file is managed by the PC tool (INVENTORY.CSV).
 
 #define INV_TBL_BG    lv_color_hex(0xF4F7FB)  // light table background
@@ -1055,9 +1094,8 @@ static bool inv_item_visible(const inv_item_t *it)
     if (s_inv_filter == 1 && it->qty <= 0) return false;
     if (s_inv_filter == 2 && it->qty > 0) return false;
     if (s_inv_query[0] &&
-        strcasestr(it->spec, s_inv_query) == NULL &&
-        strcasestr(it->lcsc, s_inv_query) == NULL &&
-        strcasestr(it->name, s_inv_query) == NULL) {
+        strcasestr(it->model, s_inv_query) == NULL &&
+        strcasestr(it->product_no, s_inv_query) == NULL) {
         return false;
     }
     return true;
@@ -1165,7 +1203,7 @@ static void on_inv_search(lv_event_t *e)
     lv_obj_clear_flag(s_inv_edit_overlay, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *lbl = lv_label_create(s_inv_edit_overlay);
-    lv_label_set_text(lbl, "Filter NAME / SPEC / LCSC");
+    lv_label_set_text(lbl, "Filter MODEL / PRODUCT NO");
     lv_obj_set_style_text_color(lbl, CLR_TEXT, 0);
     lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, 6);
 
@@ -1209,8 +1247,8 @@ static void on_inv_qty_minus(lv_event_t *e)
         char stamp[32];
         net_time_str(stamp, sizeof(stamp));
         inv_hist_append(stamp, "OUT",
-                        s_inv.items[s_inv_edit_idx].spec,
-                        s_inv.items[s_inv_edit_idx].lcsc, 1);
+                        s_inv.items[s_inv_edit_idx].model,
+                        s_inv.items[s_inv_edit_idx].product_no, 1);
         ESP_LOGI(TAG, "inv: qty-- idx=%d now=%ld", s_inv_edit_idx,
                  (long)s_inv.items[s_inv_edit_idx].qty);
     }
@@ -1226,8 +1264,8 @@ static void on_inv_qty_plus(lv_event_t *e)
     char stamp[32];
     net_time_str(stamp, sizeof(stamp));
     inv_hist_append(stamp, "IN",
-                    s_inv.items[s_inv_edit_idx].spec,
-                    s_inv.items[s_inv_edit_idx].lcsc, 1);
+                    s_inv.items[s_inv_edit_idx].model,
+                    s_inv.items[s_inv_edit_idx].product_no, 1);
     ESP_LOGI(TAG, "inv: qty++ idx=%d now=%ld", s_inv_edit_idx,
              (long)s_inv.items[s_inv_edit_idx].qty);
     refresh_inventory_list();
@@ -1269,9 +1307,9 @@ static void on_inv_del(lv_event_t *e)
     inv_item_t *it = &s_inv.items[s_inv_edit_idx];
     char stamp[32];
     net_time_str(stamp, sizeof(stamp));
-    bool hist_ok = inv_hist_append(stamp, "DEL", it->spec, it->lcsc, it->qty);
-    ESP_LOGI(TAG, "inv: DEL idx=%d spec=%s lcsc=%s qty=%ld hist=%d",
-             s_inv_edit_idx, it->spec, it->lcsc, (long)it->qty, (int)hist_ok);
+    bool hist_ok = inv_hist_append(stamp, "DEL", it->model, it->product_no, it->qty);
+    ESP_LOGI(TAG, "inv: DEL idx=%d model=%s product=%s qty=%ld hist=%d",
+             s_inv_edit_idx, it->model, it->product_no, (long)it->qty, (int)hist_ok);
 
     for (int i = s_inv_edit_idx; i + 1 < s_inv.count; ++i) {
         s_inv.items[i] = s_inv.items[i + 1];
@@ -1312,19 +1350,19 @@ static void inv_create_row_pool(void)
         lv_obj_clear_flag(r->row, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_event_cb(r->row, on_inv_row_click, LV_EVENT_CLICKED, NULL);
 
-        r->spec = lv_label_create(r->row);
-        lv_label_set_long_mode(r->spec, LV_LABEL_LONG_DOT);
-        lv_obj_set_style_text_color(r->spec, INV_TBL_BLACK, 0);
-        lv_obj_set_style_text_align(r->spec, LV_TEXT_ALIGN_LEFT, 0);
+        r->model = lv_label_create(r->row);
+        lv_label_set_long_mode(r->model, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_color(r->model, INV_TBL_BLACK, 0);
+        lv_obj_set_style_text_align(r->model, LV_TEXT_ALIGN_LEFT, 0);
 
         r->qty = lv_label_create(r->row);
         lv_obj_set_style_text_color(r->qty, INV_TBL_BLACK, 0);
         lv_obj_set_style_text_align(r->qty, LV_TEXT_ALIGN_CENTER, 0);
 
-        r->lcsc = lv_label_create(r->row);
-        lv_label_set_long_mode(r->lcsc, LV_LABEL_LONG_DOT);
-        lv_obj_set_style_text_color(r->lcsc, INV_TBL_BLACK, 0);
-        lv_obj_set_style_text_align(r->lcsc, LV_TEXT_ALIGN_LEFT, 0);
+        r->product_no = lv_label_create(r->row);
+        lv_label_set_long_mode(r->product_no, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_color(r->product_no, INV_TBL_BLACK, 0);
+        lv_obj_set_style_text_align(r->product_no, LV_TEXT_ALIGN_LEFT, 0);
 
         r->minus = make_btn(r->row, "-", on_inv_qty_minus, 0);
         lv_obj_set_size(r->minus, 22, 18);
@@ -1373,7 +1411,7 @@ static void build_inventory_screen(void)
     lv_obj_set_size(s_inv_stats, 300, 16);
     lv_label_set_long_mode(s_inv_stats, LV_LABEL_LONG_DOT);
 
-    lv_obj_t *h1 = make_btn(scr, "SPEC", on_inv_search, 0);
+    lv_obj_t *h1 = make_btn(scr, "MODEL", on_inv_search, 0);
     lv_obj_set_size(h1, 70, 18);
     lv_obj_set_pos(h1, 10, 82);
     lv_obj_set_style_bg_color(h1, CLR_PANEL, 0);
@@ -1382,7 +1420,7 @@ static void build_inventory_screen(void)
     lv_label_set_text(h2, "QTY");
     lv_obj_set_style_text_color(h2, CLR_ACCENT, 0);
     lv_obj_set_pos(h2, 172, 85);
-    lv_obj_t *h3 = make_btn(scr, "LCSC", on_inv_search, 0);
+    lv_obj_t *h3 = make_btn(scr, "PART#", on_inv_search, 0);
     lv_obj_set_size(h3, 70, 18);
     lv_obj_set_pos(h3, 212, 82);
     lv_obj_set_style_bg_color(h3, CLR_PANEL, 0);
@@ -1448,21 +1486,27 @@ static void refresh_inventory_window(bool force)
             const char *act = h->action;
             bool is_in  = (act[0] == 'I');
             bool is_del = (act[0] == 'D');
-            char line[96];
+            /*
+             * History line worst case is over 96 bytes:
+             * action + timestamp + 63-byte model + quantity.
+             * ESP-IDF enables -Werror=format-truncation, so keep enough room
+             * for the full formatted text instead of relying on truncation.
+             */
+            char line[160];
 
             if (is_del) {
                 snprintf(line, sizeof(line), "%s %s %s x%ld", LV_SYMBOL_TRASH,
-                         h->stamp, h->spec[0] ? h->spec : h->lcsc, (long)h->qty);
+                         h->stamp, h->model[0] ? h->model : h->product_no, (long)h->qty);
             } else {
                 snprintf(line, sizeof(line), "%s %s %s x%ld", act,
-                         h->stamp, h->spec[0] ? h->spec : h->lcsc, (long)h->qty);
+                         h->stamp, h->model[0] ? h->model : h->product_no, (long)h->qty);
             }
 
-            label_set_text_if_changed(r->spec, line);
-            lv_obj_set_pos(r->spec, 6, 2);
-            lv_obj_set_size(r->spec, 278, 16);
+            label_set_text_if_changed(r->model, line);
+            lv_obj_set_pos(r->model, 6, 2);
+            lv_obj_set_size(r->model, 278, 16);
             lv_obj_add_flag(r->qty, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(r->lcsc, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(r->product_no, LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(r->minus, LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(r->plus, LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(r->del, LV_OBJ_FLAG_HIDDEN);
@@ -1485,7 +1529,7 @@ static void refresh_inventory_window(bool force)
         lv_obj_add_flag(r->row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_set_user_data(r->row, (void *)(intptr_t)idx);
         lv_obj_clear_flag(r->qty, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(r->lcsc, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(r->product_no, LV_OBJ_FLAG_HIDDEN);
 
         int c1w = selected ? 100 : 168;
         int c2x = selected ? 110 : 178;
@@ -1493,10 +1537,9 @@ static void refresh_inventory_window(bool force)
         int c3x = selected ? 150 : 224;
         int c3w = selected ? 68 : 62;
 
-        label_set_text_if_changed(r->spec, it->spec[0] ? it->spec :
-                                          (it->name[0] ? it->name : it->lcsc));
-        lv_obj_set_pos(r->spec, 6, 3);
-        lv_obj_set_size(r->spec, c1w, 16);
+        label_set_text_if_changed(r->model, it->model[0] ? it->model : it->product_no);
+        lv_obj_set_pos(r->model, 6, 3);
+        lv_obj_set_size(r->model, c1w, 16);
 
         char qbuf[16];
         snprintf(qbuf, sizeof(qbuf), "x%ld", (long)it->qty);
@@ -1504,9 +1547,9 @@ static void refresh_inventory_window(bool force)
         lv_obj_set_pos(r->qty, c2x, 3);
         lv_obj_set_size(r->qty, c2w, 16);
 
-        label_set_text_if_changed(r->lcsc, it->lcsc);
-        lv_obj_set_pos(r->lcsc, c3x, 3);
-        lv_obj_set_size(r->lcsc, c3w, 16);
+        label_set_text_if_changed(r->product_no, it->product_no);
+        lv_obj_set_pos(r->product_no, c3x, 3);
+        lv_obj_set_size(r->product_no, c3w, 16);
 
         if (selected) {
             lv_obj_set_style_bg_color(r->row, lv_color_hex(0xBFE3FF), 0);
@@ -2161,25 +2204,80 @@ static void build_vocab_dictation_screen(void)
     make_title(scr, "Dictation - Write");
     make_back_btn(scr);
 
-    s_dict_prompt = make_label(scr, "Write the word here", 10, 42, CLR_TEXT);
-    s_dict_feedback = make_label(scr, "Handwriting pad enabled", 10, 220, CLR_TEXT_DIM);
+    /* Chinese meaning is the clue; the English spelling remains hidden. */
+    s_hand_hint = make_label(scr, "中文提示:", 10, 40, CLR_TEXT_DIM);
+    lv_obj_set_style_text_font(s_hand_hint, &font_cn16, 0);
 
-    s_hand_canvas = lv_canvas_create(scr);
-    lv_canvas_set_buffer(s_hand_canvas, s_hand_canvas_buf, HAND_W, HAND_H, LV_IMG_CF_INDEXED_1BIT);
-    lv_canvas_fill_bg(s_hand_canvas, lv_color_white(), LV_OPA_COVER);
-    lv_obj_set_pos(s_hand_canvas, 20, 75);
+    s_dict_prompt = lv_label_create(scr);
+    lv_obj_set_pos(s_dict_prompt, 82, 39);
+    lv_obj_set_size(s_dict_prompt, 228, 20);
+    lv_label_set_long_mode(s_dict_prompt, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(s_dict_prompt, &font_cn16, 0);
+    lv_obj_set_style_text_color(s_dict_prompt, CLR_TEXT, 0);
+
+    /* The accumulated recognized word is always visible before CHECK. */
+    s_dict_ta = lv_textarea_create(scr);
+    lv_obj_set_pos(s_dict_ta, 10, 61);
+    lv_obj_set_size(s_dict_ta, 300, 27);
+    lv_textarea_set_one_line(s_dict_ta, true);
+    lv_textarea_set_max_length(s_dict_ta, VOCAB_WORD_MAX - 1);
+    lv_textarea_set_placeholder_text(s_dict_ta, "YOUR WORD");
+    lv_textarea_set_accepted_chars(s_dict_ta, "abcdefghijklmnopqrstuvwxyz");
+    lv_textarea_set_cursor_click_pos(s_dict_ta, false);
+    lv_obj_set_style_text_font(s_dict_ta, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_bg_color(s_dict_ta, CLR_PANEL, 0);
+    lv_obj_set_style_text_color(s_dict_ta, CLR_TEXT, 0);
+    lv_obj_set_style_border_color(s_dict_ta, CLR_PRIMARY, 0);
+    lv_obj_set_style_radius(s_dict_ta, 7, 0);
+
+    /*
+     * Use a normal white LVGL object as the handwriting pad and draw the saved
+     * stroke points in LV_EVENT_DRAW_POST. This is much more reliable than an
+     * indexed 1-bit canvas on this display path, while using almost no extra RAM.
+     */
+    s_hand_canvas = lv_obj_create(scr);
+    lv_obj_set_pos(s_hand_canvas, 10, 96);
     lv_obj_set_size(s_hand_canvas, HAND_W, HAND_H);
+    lv_obj_set_style_bg_color(s_hand_canvas, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(s_hand_canvas, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_hand_canvas, 1, 0);
+    lv_obj_set_style_border_color(s_hand_canvas, CLR_TEXT_DIM, 0);
+    lv_obj_set_style_radius(s_hand_canvas, 4, 0);
+    lv_obj_set_style_pad_all(s_hand_canvas, 0, 0);
+    lv_obj_clear_flag(s_hand_canvas, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_hand_canvas, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_hand_canvas, hand_draw_event, LV_EVENT_ALL, NULL);
 
     s_hand_clear = make_btn(scr, "CLEAR", hand_clear_event, 0);
-    lv_obj_set_size(s_hand_clear, 90, 35);
-    lv_obj_set_pos(s_hand_clear, 110, 180);
+    lv_obj_set_size(s_hand_clear, 69, 32);
+    lv_obj_set_pos(s_hand_clear, 10, 176);
 
-    s_dict_check = make_btn(scr, "CHECK", NULL, 0);
-    lv_obj_set_size(s_dict_check, 90, 35);
-    lv_obj_set_pos(s_dict_check, 210, 180);
+    s_hand_add = make_btn(scr, "ADD", hand_add_event, 0);
+    lv_obj_set_size(s_hand_add, 69, 32);
+    lv_obj_set_pos(s_hand_add, 87, 176);
+    lv_obj_set_style_bg_color(s_hand_add, CLR_PRIMARY, 0);
 
+    s_hand_del = make_btn(scr, "DEL", hand_del_event, 0);
+    lv_obj_set_size(s_hand_del, 69, 32);
+    lv_obj_set_pos(s_hand_del, 164, 176);
+    lv_obj_set_style_bg_color(s_hand_del, CLR_PANEL_2, 0);
+
+    s_dict_check = make_btn(scr, "CHECK", dict_check_event, 0);
+    lv_obj_set_size(s_dict_check, 69, 32);
+    lv_obj_set_pos(s_dict_check, 241, 176);
+    lv_obj_set_style_bg_color(s_dict_check, CLR_OK, 0);
+
+    s_dict_feedback = lv_label_create(scr);
+    lv_obj_set_pos(s_dict_feedback, 10, 213);
+    lv_obj_set_size(s_dict_feedback, 300, 22);
+    lv_label_set_long_mode(s_dict_feedback, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(s_dict_feedback, &font_cn16, 0);
+    lv_obj_set_style_text_align(s_dict_feedback, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(s_dict_feedback, CLR_TEXT_DIM, 0);
+
+    s_dict_checked = false;
     hand_clear_pad();
+    refresh_vocab_dictation();
 }
 
 static void build_vocab_plan_screen(void)
@@ -2190,14 +2288,71 @@ static void build_vocab_plan_screen(void)
     make_title(scr, "Study Plan");
     make_back_btn(scr);
 
-    s_plan_value = make_label(scr, "Plan ready", 20, 80, CLR_TEXT);
-    s_plan_stats = make_label(scr, "", 20, 120, CLR_TEXT_DIM);
+    lv_obj_t *title = make_label(scr, "每日学习目标", 20, 49, CLR_TEXT_DIM);
+    lv_obj_set_size(title, 280, 20);
+    lv_obj_set_style_text_font(title, &font_cn16, 0);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+
+    s_plan_value = make_label(scr, "", 20, 76, CLR_TEXT);
+    lv_obj_set_size(s_plan_value, 280, 24);
+    lv_obj_set_style_text_font(s_plan_value, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_align(s_plan_value, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *minus = make_btn(scr, "-5", plan_action_event, 0);
+    lv_obj_set_pos(minus, 20, 111);
+    lv_obj_set_size(minus, 82, 42);
+    lv_obj_set_style_bg_color(minus, CLR_PANEL_2, 0);
+
+    lv_obj_t *save = make_btn(scr, "SAVE", plan_action_event, 1);
+    lv_obj_set_pos(save, 119, 111);
+    lv_obj_set_size(save, 82, 42);
+    lv_obj_set_style_bg_color(save, CLR_OK, 0);
+
+    lv_obj_t *plus = make_btn(scr, "+5", plan_action_event, 2);
+    lv_obj_set_pos(plus, 218, 111);
+    lv_obj_set_size(plus, 82, 42);
+
+    s_plan_stats = lv_label_create(scr);
+    lv_obj_set_pos(s_plan_stats, 20, 166);
+    lv_obj_set_size(s_plan_stats, 280, 58);
+    lv_label_set_long_mode(s_plan_stats, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(s_plan_stats, &font_cn16, 0);
+    lv_obj_set_style_text_align(s_plan_stats, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(s_plan_stats, CLR_TEXT_DIM, 0);
+
+    s_plan_edit_target = vocab_get_daily_target();
+    s_plan_notice[0] = '\0';
+    refresh_plan_labels();
 }
 
 static void refresh_vocab_dictation(void)
 {
-    if (s_dict_feedback) {
-        lv_label_set_text(s_dict_feedback, "Type the word and check");
+    if (s_screen != SCREEN_VOCAB_DICTATION) return;
+
+    if (vocab_session_finished()) {
+        if (s_dict_prompt) lv_label_set_text(s_dict_prompt, "本轮完成");
+        if (s_dict_feedback) {
+            lv_label_set_text(s_dict_feedback, "学习进度已保存 点击返回继续");
+            lv_obj_set_style_text_color(s_dict_feedback, CLR_OK, 0);
+        }
+        if (s_dict_check) set_btn_text(s_dict_check, "DONE");
+        return;
+    }
+
+    vocab_word_t w;
+    if (!vocab_get_current(&w)) return;
+
+    if (s_dict_prompt) {
+        char meaning[VOCAB_MEANING_MAX];
+        format_cn_display(w.meaning[0] ? w.meaning : "无中文释义", meaning, sizeof(meaning));
+        lv_label_set_text(s_dict_prompt, meaning);
+    }
+
+    if (s_dict_check) set_btn_text(s_dict_check, s_dict_checked ? "NEXT" : "CHECK");
+
+    if (!s_dict_checked && s_dict_feedback) {
+        lv_label_set_text(s_dict_feedback, "可一次写多个大写字母 字母间留空 点 ADD");
+        lv_obj_set_style_text_color(s_dict_feedback, CLR_TEXT_DIM, 0);
     }
 }
 
@@ -2206,7 +2361,6 @@ static void hand_clear_pad(void)
     s_hand_point_count = 0;
     s_hand_pen_down = false;
     if (s_hand_canvas) {
-        lv_canvas_fill_bg(s_hand_canvas, lv_color_white(), LV_OPA_COVER);
         lv_obj_invalidate(s_hand_canvas);
     }
 }
@@ -2214,44 +2368,600 @@ static void hand_clear_pad(void)
 static void hand_clear_event(lv_event_t *e)
 {
     (void)e;
+    if (!click_ok()) return;
+    if (s_dict_checked) {
+        if (s_dict_feedback) lv_label_set_text(s_dict_feedback, "已经 CHECK 请点 NEXT 进入下一个单词");
+        return;
+    }
     hand_clear_pad();
+    if (s_dict_feedback) {
+        lv_label_set_text(s_dict_feedback, "手写区已清空 已识别单词保留");
+        lv_obj_set_style_text_color(s_dict_feedback, CLR_TEXT_DIM, 0);
+    }
+}
+
+static void hand_del_event(lv_event_t *e)
+{
+    (void)e;
+    if (!click_ok()) return;
+    if (!s_dict_ta) return;
+    if (s_dict_checked) {
+        if (s_dict_feedback) lv_label_set_text(s_dict_feedback, "已经 CHECK 请点 NEXT 进入下一个单词");
+        return;
+    }
+    lv_textarea_del_char(s_dict_ta);
+    if (s_dict_feedback) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "已删最后一个字母 当前: %.47s", lv_textarea_get_text(s_dict_ta));
+        lv_label_set_text(s_dict_feedback, msg);
+        lv_obj_set_style_text_color(s_dict_feedback, CLR_TEXT_DIM, 0);
+    }
+}
+
+/*
+ * Offline uppercase handwriting classifier.
+ *
+ * Compared with the previous 5x7-only matcher, this version rasterizes each
+ * written letter into a 9x13 normalized grid, compares both pixel geometry and
+ * row/column profiles, and segments multiple letters by horizontal whitespace.
+ * It remains intentionally lightweight so it can run locally on the ESP32-S3.
+ */
+static const uint8_t s_hand_templates[26][7] = {
+    {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}, /* A */
+    {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}, /* B */
+    {0x0F,0x10,0x10,0x10,0x10,0x10,0x0F}, /* C */
+    {0x1E,0x11,0x11,0x11,0x11,0x11,0x1E}, /* D */
+    {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}, /* E */
+    {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10}, /* F */
+    {0x0F,0x10,0x10,0x17,0x11,0x11,0x0E}, /* G */
+    {0x11,0x11,0x11,0x1F,0x11,0x11,0x11}, /* H */
+    {0x1F,0x04,0x04,0x04,0x04,0x04,0x1F}, /* I */
+    {0x07,0x02,0x02,0x02,0x12,0x12,0x0C}, /* J */
+    {0x11,0x12,0x14,0x18,0x14,0x12,0x11}, /* K */
+    {0x10,0x10,0x10,0x10,0x10,0x10,0x1F}, /* L */
+    {0x11,0x1B,0x15,0x15,0x11,0x11,0x11}, /* M */
+    {0x11,0x19,0x15,0x13,0x11,0x11,0x11}, /* N */
+    {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}, /* O */
+    {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}, /* P */
+    {0x0E,0x11,0x11,0x11,0x15,0x12,0x0D}, /* Q */
+    {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11}, /* R */
+    {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}, /* S */
+    {0x1F,0x04,0x04,0x04,0x04,0x04,0x04}, /* T */
+    {0x11,0x11,0x11,0x11,0x11,0x11,0x0E}, /* U */
+    {0x11,0x11,0x11,0x11,0x11,0x0A,0x04}, /* V */
+    {0x11,0x11,0x11,0x11,0x15,0x1B,0x11}, /* W */
+    {0x11,0x11,0x0A,0x04,0x0A,0x11,0x11}, /* X */
+    {0x11,0x11,0x0A,0x04,0x04,0x04,0x04}, /* Y */
+    {0x1F,0x01,0x02,0x04,0x08,0x10,0x1F}, /* Z */
+};
+
+typedef struct {
+    uint8_t cell[HAND_GRID_H][HAND_GRID_W];
+    int span_x;
+    int span_y;
+} hand_grid_t;
+
+static void hand_ngrid_mark(hand_grid_t *g, int x, int y)
+{
+    if (!g || x < 0 || x >= HAND_GRID_W || y < 0 || y >= HAND_GRID_H) return;
+    g->cell[y][x] = 1;
+}
+
+static void hand_ngrid_line(hand_grid_t *g, int x0, int y0, int x1, int y1)
+{
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        hand_ngrid_mark(g, x0, y0);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = err * 2;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+static bool hand_template_cell(int idx, int x, int y)
+{
+    return (s_hand_templates[idx][y] & (1U << (4 - x))) != 0;
+}
+
+static void hand_build_template(int idx, hand_grid_t *g)
+{
+    memset(g, 0, sizeof(*g));
+    g->span_x = HAND_GRID_W - 1;
+    g->span_y = HAND_GRID_H - 1;
+
+    for (int y = 0; y < 7; ++y) {
+        for (int x = 0; x < 5; ++x) {
+            if (!hand_template_cell(idx, x, y)) continue;
+            int gx = x * 2;
+            int gy = y * 2;
+            hand_ngrid_mark(g, gx, gy);
+
+            if (x + 1 < 5 && hand_template_cell(idx, x + 1, y))
+                hand_ngrid_line(g, gx, gy, gx + 2, gy);
+            if (y + 1 < 7 && hand_template_cell(idx, x, y + 1))
+                hand_ngrid_line(g, gx, gy, gx, gy + 2);
+            if (y + 1 < 7 && x + 1 < 5 && hand_template_cell(idx, x + 1, y + 1))
+                hand_ngrid_line(g, gx, gy, gx + 2, gy + 2);
+            if (y + 1 < 7 && x > 0 && hand_template_cell(idx, x - 1, y + 1))
+                hand_ngrid_line(g, gx, gy, gx - 2, gy + 2);
+        }
+    }
+}
+
+static bool hand_build_input(int x0, int x1, hand_grid_t *g)
+{
+    int min_x = HAND_W, min_y = HAND_H, max_x = -1, max_y = -1;
+    int real_points = 0;
+    memset(g, 0, sizeof(*g));
+
+    for (int i = 0; i < s_hand_point_count; ++i) {
+        lv_point_t p = s_hand_points[i];
+        if (p.x == HAND_BREAK_COORD || p.x < x0 || p.x > x1) continue;
+        if (p.x < min_x) min_x = p.x;
+        if (p.x > max_x) max_x = p.x;
+        if (p.y < min_y) min_y = p.y;
+        if (p.y > max_y) max_y = p.y;
+        real_points++;
+    }
+    if (real_points < 3 || max_x < min_x || max_y < min_y) return false;
+
+    int span_x = max_x - min_x;
+    int span_y = max_y - min_y;
+    if (span_x < 1) span_x = 1;
+    if (span_y < 1) span_y = 1;
+    g->span_x = span_x;
+    g->span_y = span_y;
+
+    bool have_prev = false;
+    int prev_x = 0, prev_y = 0;
+    for (int i = 0; i < s_hand_point_count; ++i) {
+        lv_point_t p = s_hand_points[i];
+        if (p.x == HAND_BREAK_COORD) {
+            have_prev = false;
+            continue;
+        }
+        if (p.x < x0 || p.x > x1) {
+            have_prev = false;
+            continue;
+        }
+
+        int gx = ((p.x - min_x) * (HAND_GRID_W - 1) + span_x / 2) / span_x;
+        int gy = ((p.y - min_y) * (HAND_GRID_H - 1) + span_y / 2) / span_y;
+        if (gx < 0) gx = 0;
+        if (gx >= HAND_GRID_W) gx = HAND_GRID_W - 1;
+        if (gy < 0) gy = 0;
+        if (gy >= HAND_GRID_H) gy = HAND_GRID_H - 1;
+
+        if (have_prev) hand_ngrid_line(g, prev_x, prev_y, gx, gy);
+        else hand_ngrid_mark(g, gx, gy);
+        prev_x = gx;
+        prev_y = gy;
+        have_prev = true;
+    }
+    return true;
+}
+
+static int hand_grid_count(const hand_grid_t *g)
+{
+    int n = 0;
+    for (int y = 0; y < HAND_GRID_H; ++y)
+        for (int x = 0; x < HAND_GRID_W; ++x)
+            n += g->cell[y][x] ? 1 : 0;
+    return n;
+}
+
+static int hand_grid_distance(const hand_grid_t *a, const hand_grid_t *b)
+{
+    int ac = hand_grid_count(a);
+    int bc = hand_grid_count(b);
+    if (ac <= 0 || bc <= 0) return 100000;
+
+    int ab = 0;
+    for (int ay = 0; ay < HAND_GRID_H; ++ay) {
+        for (int ax = 0; ax < HAND_GRID_W; ++ax) {
+            if (!a->cell[ay][ax]) continue;
+            int best = 99;
+            for (int by = 0; by < HAND_GRID_H; ++by) {
+                for (int bx = 0; bx < HAND_GRID_W; ++bx) {
+                    if (!b->cell[by][bx]) continue;
+                    int d = abs(ax - bx) + abs(ay - by);
+                    if (d < best) best = d;
+                }
+            }
+            ab += best;
+        }
+    }
+
+    int ba = 0;
+    for (int by = 0; by < HAND_GRID_H; ++by) {
+        for (int bx = 0; bx < HAND_GRID_W; ++bx) {
+            if (!b->cell[by][bx]) continue;
+            int best = 99;
+            for (int ay = 0; ay < HAND_GRID_H; ++ay) {
+                for (int ax = 0; ax < HAND_GRID_W; ++ax) {
+                    if (!a->cell[ay][ax]) continue;
+                    int d = abs(ax - bx) + abs(ay - by);
+                    if (d < best) best = d;
+                }
+            }
+            ba += best;
+        }
+    }
+
+    int cost = (ab * 100) / ac + (ba * 100) / bc;
+
+    int profile = 0;
+    for (int y = 0; y < HAND_GRID_H; ++y) {
+        int ar = 0, br = 0;
+        for (int x = 0; x < HAND_GRID_W; ++x) {
+            ar += a->cell[y][x] ? 1 : 0;
+            br += b->cell[y][x] ? 1 : 0;
+        }
+        profile += abs((ar * 100) / ac - (br * 100) / bc);
+    }
+    for (int x = 0; x < HAND_GRID_W; ++x) {
+        int av = 0, bv = 0;
+        for (int y = 0; y < HAND_GRID_H; ++y) {
+            av += a->cell[y][x] ? 1 : 0;
+            bv += b->cell[y][x] ? 1 : 0;
+        }
+        profile += abs((av * 100) / ac - (bv * 100) / bc);
+    }
+    cost += profile / 4;
+    cost += abs(ac - bc) * 2;
+    return cost;
+}
+
+static bool hand_grid_has(const hand_grid_t *g, int x0, int x1, int y0, int y1)
+{
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 >= HAND_GRID_W) x1 = HAND_GRID_W - 1;
+    if (y1 >= HAND_GRID_H) y1 = HAND_GRID_H - 1;
+    for (int y = y0; y <= y1; ++y)
+        for (int x = x0; x <= x1; ++x)
+            if (g->cell[y][x]) return true;
+    return false;
+}
+
+static int hand_shape_adjust(int idx, const hand_grid_t *g)
+{
+    int adjust = 0;
+
+    /* A: apex near the top, two lower legs, and a middle cross stroke. */
+    if (idx == 0) {
+        bool apex = hand_grid_has(g, 3, 5, 0, 3);
+        bool left_leg = hand_grid_has(g, 0, 3, 7, 12);
+        bool right_leg = hand_grid_has(g, 5, 8, 7, 12);
+        bool cross = false;
+        for (int y = 4; y <= 9; ++y) {
+            int minx = HAND_GRID_W, maxx = -1, n = 0;
+            for (int x = 0; x < HAND_GRID_W; ++x) {
+                if (!g->cell[y][x]) continue;
+                if (x < minx) minx = x;
+                if (x > maxx) maxx = x;
+                n++;
+            }
+            if (n >= 3 && minx <= 3 && maxx >= 5) { cross = true; break; }
+        }
+        if (apex && left_leg && right_leg && cross) adjust -= 180;
+    }
+
+    /* A very narrow tall glyph is much more likely to be I than H/T/L. */
+    if (idx == 8 && g->span_y > 0 && g->span_x * 100 / g->span_y < 35) adjust -= 120;
+    return adjust;
+}
+
+static char hand_recognize_one(int x0, int x1, int *confidence)
+{
+    hand_grid_t input;
+    if (!hand_build_input(x0, x1, &input)) return '\0';
+
+    int best_idx = -1;
+    int best = 100000;
+    int second = 100000;
+    for (int i = 0; i < 26; ++i) {
+        hand_grid_t templ;
+        hand_build_template(i, &templ);
+        int d = hand_grid_distance(&input, &templ) + hand_shape_adjust(i, &input);
+        if (d < 0) d = 0;
+        if (d < best) {
+            second = best;
+            best = d;
+            best_idx = i;
+        } else if (d < second) {
+            second = d;
+        }
+    }
+    if (best_idx < 0) return '\0';
+
+    if (confidence) {
+        int gap = second > best ? second - best : 0;
+        int c = 96 - best / 12 + gap / 5;
+        if (c < 25) c = 25;
+        if (c > 99) c = 99;
+        *confidence = c;
+    }
+    return (char)('A' + best_idx);
+}
+
+static int hand_segment_ranges(int ranges[][2], int max_ranges)
+{
+    uint8_t occupied[HAND_W];
+    memset(occupied, 0, sizeof(occupied));
+
+    bool have_prev = false;
+    lv_point_t prev = {0, 0};
+    for (int i = 0; i < s_hand_point_count; ++i) {
+        lv_point_t p = s_hand_points[i];
+        if (p.x == HAND_BREAK_COORD) {
+            have_prev = false;
+            continue;
+        }
+        if (p.x < 0 || p.x >= HAND_W) continue;
+        occupied[p.x] = 1;
+        if (have_prev) {
+            int a = prev.x < p.x ? prev.x : p.x;
+            int b = prev.x > p.x ? prev.x : p.x;
+            if (a < 0) a = 0;
+            if (b >= HAND_W) b = HAND_W - 1;
+            for (int x = a; x <= b; ++x) occupied[x] = 1;
+        }
+        prev = p;
+        have_prev = true;
+    }
+
+    int n = 0;
+    int start = -1;
+    int last = -1;
+    int gap = 0;
+    for (int x = 0; x < HAND_W; ++x) {
+        if (occupied[x]) {
+            if (start < 0) start = x;
+            last = x;
+            gap = 0;
+        } else if (start >= 0) {
+            gap++;
+            if (gap >= HAND_SEG_GAP) {
+                if (n < max_ranges) {
+                    ranges[n][0] = start;
+                    ranges[n][1] = last;
+                    n++;
+                }
+                start = -1;
+                last = -1;
+                gap = 0;
+            }
+        }
+    }
+    if (start >= 0 && n < max_ranges) {
+        ranges[n][0] = start;
+        ranges[n][1] = last;
+        n++;
+    }
+    return n;
+}
+
+static int hand_recognize_segments(char *out, size_t out_sz, int *avg_confidence)
+{
+    if (!out || out_sz < 2) return 0;
+    out[0] = '\0';
+
+    int ranges[HAND_MAX_SEGMENTS][2];
+    int segments = hand_segment_ranges(ranges, HAND_MAX_SEGMENTS);
+    if (segments <= 0) return 0;
+
+    int total_conf = 0;
+    int written = 0;
+    for (int i = 0; i < segments && written + 1 < (int)out_sz; ++i) {
+        int conf = 0;
+        char c = hand_recognize_one(ranges[i][0], ranges[i][1], &conf);
+        if (!c) continue;
+        out[written++] = c;
+        total_conf += conf;
+    }
+    out[written] = '\0';
+    if (avg_confidence) *avg_confidence = written > 0 ? total_conf / written : 0;
+    return written;
+}
+
+static int hand_commit_pad(bool show_feedback)
+{
+    if (!s_dict_ta || s_hand_point_count <= 0) return 0;
+
+    char letters[HAND_MAX_SEGMENTS + 1];
+    int confidence = 0;
+    int n = hand_recognize_segments(letters, sizeof(letters), &confidence);
+    if (n <= 0) {
+        if (show_feedback && s_dict_feedback) {
+            lv_label_set_text(s_dict_feedback, "\u8bf7\u5148\u5728\u767d\u8272\u624b\u5199\u533a\u5199\u5927\u5199\u82f1\u6587\u5b57\u6bcd");
+            lv_obj_set_style_text_color(s_dict_feedback, CLR_WARN, 0);
+        }
+        return 0;
+    }
+
+    size_t len = strlen(lv_textarea_get_text(s_dict_ta));
+    int added = 0;
+    for (int i = 0; i < n && len < VOCAB_WORD_MAX - 1; ++i, ++len) {
+        lv_textarea_add_char(s_dict_ta, (uint32_t)(letters[i] - 'A' + 'a'));
+        added++;
+    }
+
+    if (added > 0) hand_clear_pad();
+
+    if (show_feedback && s_dict_feedback) {
+        char msg[160];
+        if (added <= 0) {
+            lv_label_set_text(s_dict_feedback, "\u5355\u8bcd\u592a\u957f \u4e0d\u80fd\u7ee7\u7eed\u6dfb\u52a0");
+            lv_obj_set_style_text_color(s_dict_feedback, CLR_WARN, 0);
+        } else {
+            snprintf(msg, sizeof(msg), "\u8bc6\u522b: %.12s  \u5f53\u524d: %.47s", letters, lv_textarea_get_text(s_dict_ta));
+            lv_label_set_text(s_dict_feedback, msg);
+            lv_obj_set_style_text_color(s_dict_feedback, confidence >= 60 ? CLR_OK : CLR_WARN, 0);
+        }
+    }
+    return added;
+}
+
+static void hand_add_event(lv_event_t *e)
+{
+    (void)e;
+    if (!click_ok()) return;
+    if (!s_dict_ta) return;
+    if (s_dict_checked) {
+        if (s_dict_feedback) lv_label_set_text(s_dict_feedback, "\u5df2\u7ecf CHECK \u8bf7\u70b9 NEXT \u8fdb\u5165\u4e0b\u4e00\u4e2a\u5355\u8bcd");
+        return;
+    }
+    (void)hand_commit_pad(true);
+}
+
+static void dict_check_event(lv_event_t *e)
+{
+    (void)e;
+    if (!click_ok()) return;
+
+    if (vocab_session_finished()) {
+        lv_port_post_cmd(UI_CMD_SCREEN, SCREEN_VOCAB);
+        return;
+    }
+
+    if (s_dict_checked) {
+        (void)vocab_next();
+        s_dict_checked = false;
+        if (s_dict_ta) lv_textarea_set_text(s_dict_ta, "");
+        hand_clear_pad();
+        refresh_vocab_dictation();
+        return;
+    }
+
+    if (s_hand_point_count > 0) (void)hand_commit_pad(false);
+
+    const char *answer = s_dict_ta ? lv_textarea_get_text(s_dict_ta) : "";
+    if (!answer || !answer[0]) {
+        if (s_dict_feedback) {
+            lv_label_set_text(s_dict_feedback, "还没有输入单词 可直接手写后点 CHECK");
+            lv_obj_set_style_text_color(s_dict_feedback, CLR_WARN, 0);
+        }
+        return;
+    }
+
+    vocab_word_t w;
+    if (!vocab_get_current(&w)) return;
+    bool correct = vocab_check_dictation(answer);
+    (void)vocab_mark_current(correct);
+    s_dict_checked = true;
+
+    if (s_dict_feedback) {
+        char msg[192];
+        if (correct) {
+            snprintf(msg, sizeof(msg), "对了 你写的是: %.47s", answer);
+            lv_obj_set_style_text_color(s_dict_feedback, CLR_OK, 0);
+        } else {
+            snprintf(msg, sizeof(msg), "不对 你写的是: %.47s  答案: %.47s", answer, w.word);
+            lv_obj_set_style_text_color(s_dict_feedback, CLR_ERR, 0);
+        }
+        lv_label_set_text(s_dict_feedback, msg);
+    }
+    if (s_dict_check) set_btn_text(s_dict_check, "NEXT");
 }
 
 static void hand_draw_event(lv_event_t *e)
 {
     if (!s_hand_canvas) return;
     lv_event_code_t code = lv_event_get_code(e);
+
+    /* Draw the stored stroke points over the normal white pad. */
+    if (code == LV_EVENT_DRAW_POST) {
+        lv_draw_ctx_t *draw_ctx = lv_event_get_draw_ctx(e);
+        if (!draw_ctx) return;
+
+        lv_area_t area;
+        lv_obj_get_coords(s_hand_canvas, &area);
+        lv_draw_line_dsc_t dsc;
+        lv_draw_line_dsc_init(&dsc);
+        dsc.color = lv_color_black();
+        dsc.width = 3;
+        dsc.round_start = 1;
+        dsc.round_end = 1;
+
+        bool have_prev = false;
+        lv_point_t prev = {0, 0};
+        for (int i = 0; i < s_hand_point_count; ++i) {
+            lv_point_t p = s_hand_points[i];
+            if (p.x == HAND_BREAK_COORD) {
+                have_prev = false;
+                continue;
+            }
+
+            lv_point_t cur = {
+                .x = (lv_coord_t)(area.x1 + p.x),
+                .y = (lv_coord_t)(area.y1 + p.y),
+            };
+            if (have_prev) {
+                lv_draw_line(draw_ctx, &dsc, &prev, &cur);
+            }
+            prev = cur;
+            have_prev = true;
+        }
+        return;
+    }
+
+    if (s_dict_checked) return;
     if (code != LV_EVENT_PRESSING && code != LV_EVENT_PRESSED && code != LV_EVENT_RELEASED) return;
+
+    if (code == LV_EVENT_RELEASED) {
+        if (s_hand_pen_down && s_hand_point_count < HAND_MAX_POINTS) {
+            s_hand_points[s_hand_point_count].x = HAND_BREAK_COORD;
+            s_hand_points[s_hand_point_count].y = HAND_BREAK_COORD;
+            s_hand_point_count++;
+        }
+        s_hand_pen_down = false;
+        lv_obj_invalidate(s_hand_canvas);
+        return;
+    }
 
     lv_indev_t *indev = lv_indev_get_act();
     if (!indev) return;
     lv_point_t p;
     lv_indev_get_point(indev, &p);
-    p.x -= lv_obj_get_x(s_hand_canvas);
-    p.y -= lv_obj_get_y(s_hand_canvas);
+
+    lv_area_t area;
+    lv_obj_get_coords(s_hand_canvas, &area);
+    p.x -= area.x1;
+    p.y -= area.y1;
 
     if (p.x < 0 || p.y < 0 || p.x >= HAND_W || p.y >= HAND_H) return;
 
-    if (code == LV_EVENT_RELEASED) {
-        s_hand_pen_down = false;
-        return;
-    }
-
-    if (s_hand_pen_down) {
-        lv_draw_line_dsc_t dsc;
-        lv_draw_line_dsc_init(&dsc);
-        dsc.color = lv_color_black();
-        dsc.width = 3;
-        lv_point_t pts[2] = {s_hand_prev, p};
-        lv_canvas_draw_line(s_hand_canvas, pts, 2, &dsc);
-    }
-
-    s_hand_prev = p;
     s_hand_pen_down = true;
     if (s_hand_point_count < HAND_MAX_POINTS) {
         s_hand_points[s_hand_point_count++] = p;
     }
     lv_obj_invalidate(s_hand_canvas);
+}
+
+static void plan_action_event(lv_event_t *e)
+{
+    if (!click_ok()) return;
+    int id = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+
+    if (id == 0) {
+        s_plan_edit_target = s_plan_edit_target <= 5 ? 5 : (uint16_t)(s_plan_edit_target - 5);
+        s_plan_notice[0] = '\0';
+    } else if (id == 2) {
+        s_plan_edit_target = s_plan_edit_target >= 100 ? 100 : (uint16_t)(s_plan_edit_target + 5);
+        s_plan_notice[0] = '\0';
+    } else if (id == 1) {
+        esp_err_t err = vocab_set_daily_target(s_plan_edit_target);
+        if (err == ESP_OK) {
+            snprintf(s_plan_notice, sizeof(s_plan_notice), "已保存: 每天 %u 个单词", (unsigned)s_plan_edit_target);
+        } else {
+            snprintf(s_plan_notice, sizeof(s_plan_notice), "保存失败: %.31s", esp_err_to_name(err));
+        }
+    }
+    refresh_plan_labels();
 }
 
 // ---------------- 2048 screen ----------------
@@ -2359,13 +3069,163 @@ static void refresh_2048(void)
     }
 }
 
+// ---------------- FLAPPY screen ----------------
+static void on_flappy_tap(lv_event_t *e)
+{
+    (void)e;
+    if (lv_tick_get() - s_screen_enter_ms < UI_SCREEN_GUARD_MS) return;
+
+    if (s_flappy.game_over) {
+        flappy_init(&s_flappy);
+    }
+    flappy_flap(&s_flappy);
+    refresh_flappy();
+}
+
+static void build_flappy_screen(void)
+{
+    lv_obj_t *scr = lv_scr_act();
+    lv_obj_clean(scr);
+    style_screen(scr);
+    make_title(scr, "FLAPPY BIRD");
+    make_back_btn(scr);
+
+    s_flappy_score = make_label(scr, "Score: 0", 12, 35, CLR_TEXT);
+    s_flappy_status = make_label(scr, "Tap to fly", 156, 35, CLR_TEXT_DIM);
+    lv_obj_set_size(s_flappy_status, 150, 18);
+    lv_obj_set_style_text_align(s_flappy_status, LV_TEXT_ALIGN_RIGHT, 0);
+
+    s_flappy_board = lv_obj_create(scr);
+    lv_obj_set_pos(s_flappy_board, 10, 54);
+    lv_obj_set_size(s_flappy_board, FLAPPY_WORLD_W, FLAPPY_WORLD_H);
+    lv_obj_set_style_bg_color(s_flappy_board, lv_color_hex(0xDDF4FF), 0);
+    lv_obj_set_style_bg_opa(s_flappy_board, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_flappy_board, 1, 0);
+    lv_obj_set_style_border_color(s_flappy_board, lv_color_hex(0x7DD3FC), 0);
+    lv_obj_set_style_radius(s_flappy_board, 6, 0);
+    lv_obj_set_style_pad_all(s_flappy_board, 0, 0);
+    lv_obj_clear_flag(s_flappy_board, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_flappy_board, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_flappy_board, on_flappy_tap, LV_EVENT_PRESSED, NULL);
+
+    for (int i = 0; i < FLAPPY_PIPE_COUNT; ++i) {
+        s_flappy_pipe_top[i] = lv_obj_create(s_flappy_board);
+        lv_obj_set_style_bg_color(s_flappy_pipe_top[i], lv_color_hex(0x22C55E), 0);
+        lv_obj_set_style_border_width(s_flappy_pipe_top[i], 0, 0);
+        lv_obj_set_style_radius(s_flappy_pipe_top[i], 3, 0);
+        lv_obj_set_style_pad_all(s_flappy_pipe_top[i], 0, 0);
+        lv_obj_clear_flag(s_flappy_pipe_top[i], LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+
+        s_flappy_pipe_bottom[i] = lv_obj_create(s_flappy_board);
+        lv_obj_set_style_bg_color(s_flappy_pipe_bottom[i], lv_color_hex(0x16A34A), 0);
+        lv_obj_set_style_border_width(s_flappy_pipe_bottom[i], 0, 0);
+        lv_obj_set_style_radius(s_flappy_pipe_bottom[i], 3, 0);
+        lv_obj_set_style_pad_all(s_flappy_pipe_bottom[i], 0, 0);
+        lv_obj_clear_flag(s_flappy_pipe_bottom[i], LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    }
+
+    s_flappy_bird = lv_obj_create(s_flappy_board);
+    lv_obj_set_size(s_flappy_bird, FLAPPY_BIRD_W, FLAPPY_BIRD_H);
+    lv_obj_set_style_bg_color(s_flappy_bird, lv_color_hex(0xFACC15), 0);
+    lv_obj_set_style_border_width(s_flappy_bird, 1, 0);
+    lv_obj_set_style_border_color(s_flappy_bird, lv_color_hex(0xA16207), 0);
+    lv_obj_set_style_radius(s_flappy_bird, 7, 0);
+    lv_obj_set_style_pad_all(s_flappy_bird, 0, 0);
+    lv_obj_clear_flag(s_flappy_bird, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *eye = lv_obj_create(s_flappy_bird);
+    lv_obj_set_size(eye, 4, 4);
+    lv_obj_set_pos(eye, 11, 2);
+    lv_obj_set_style_bg_color(eye, lv_color_black(), 0);
+    lv_obj_set_style_border_width(eye, 0, 0);
+    lv_obj_set_style_radius(eye, 2, 0);
+    lv_obj_set_style_pad_all(eye, 0, 0);
+    lv_obj_clear_flag(eye, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+
+    flappy_init(&s_flappy);
+    refresh_flappy();
+
+    if (s_flappy_timer) lv_timer_del(s_flappy_timer);
+    s_flappy_timer = lv_timer_create(flappy_timer_cb, 55, NULL);
+}
+
+static void refresh_flappy(void)
+{
+    if (s_screen != SCREEN_FLAPPY || !s_flappy_board) return;
+
+    if (s_flappy_bird) {
+        lv_obj_set_pos(s_flappy_bird, FLAPPY_BIRD_X, s_flappy.bird_y);
+    }
+
+    for (int i = 0; i < FLAPPY_PIPE_COUNT; ++i) {
+        int top_h = s_flappy.gap_y[i];
+        int bottom_y = s_flappy.gap_y[i] + FLAPPY_GAP_H;
+        int bottom_h = FLAPPY_WORLD_H - bottom_y;
+        if (top_h < 1) top_h = 1;
+        if (bottom_h < 1) bottom_h = 1;
+
+        if (s_flappy_pipe_top[i]) {
+            lv_obj_set_pos(s_flappy_pipe_top[i], s_flappy.pipe_x[i], 0);
+            lv_obj_set_size(s_flappy_pipe_top[i], FLAPPY_PIPE_W, top_h);
+        }
+        if (s_flappy_pipe_bottom[i]) {
+            lv_obj_set_pos(s_flappy_pipe_bottom[i], s_flappy.pipe_x[i], bottom_y);
+            lv_obj_set_size(s_flappy_pipe_bottom[i], FLAPPY_PIPE_W, bottom_h);
+        }
+    }
+
+    if (s_flappy_score) {
+        char score[32];
+        snprintf(score, sizeof(score), "Score: %d", s_flappy.score);
+        lv_label_set_text(s_flappy_score, score);
+    }
+    if (s_flappy_status) {
+        if (s_flappy.game_over) {
+            lv_label_set_text(s_flappy_status, "GAME OVER - tap restart");
+            lv_obj_set_style_text_color(s_flappy_status, CLR_ERR, 0);
+        } else if (!s_flappy.started) {
+            lv_label_set_text(s_flappy_status, "Tap to fly");
+            lv_obj_set_style_text_color(s_flappy_status, CLR_TEXT_DIM, 0);
+        } else {
+            lv_label_set_text(s_flappy_status, "Keep flying!");
+            lv_obj_set_style_text_color(s_flappy_status, CLR_OK, 0);
+        }
+    }
+}
+
+static void flappy_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (s_screen != SCREEN_FLAPPY) return;
+    flappy_step(&s_flappy);
+    refresh_flappy();
+}
+
 static void refresh_plan_labels(void)
 {
     if (s_plan_value) {
-        lv_label_set_text(s_plan_value, "Plan ready");
+        char value[48];
+        snprintf(value, sizeof(value), "%u WORDS / DAY", (unsigned)s_plan_edit_target);
+        lv_label_set_text(s_plan_value, value);
     }
+
     if (s_plan_stats) {
-        lv_label_set_text(s_plan_stats, "");
+        vocab_stats_t st;
+        char stats[220];
+        uint16_t saved = vocab_get_daily_target();
+
+        if (vocab_get_stats(&st)) {
+            snprintf(stats, sizeof(stats),
+                     "今日完成: %u / %u    复习: %lu\n当前已保存目标: %u / 天%s%.63s",
+                     (unsigned)st.today_done, (unsigned)st.daily_target,
+                     (unsigned long)st.due_words, (unsigned)saved,
+                     s_plan_notice[0] ? "\n" : "", s_plan_notice);
+        } else {
+            snprintf(stats, sizeof(stats),
+                     "范围: 5 - 100  每次加减 5 个\n当前已保存目标: %u / 天%s%.63s",
+                     (unsigned)saved, s_plan_notice[0] ? "\n" : "", s_plan_notice);
+        }
+        lv_label_set_text(s_plan_stats, stats);
     }
 }
 
@@ -2382,6 +3242,7 @@ static void do_draw_all(void)
         case SCREEN_WIFI:    build_wifi_screen(); break;
         case SCREEN_SUDOKU:  build_sudoku_screen(); break;
         case SCREEN_2048: build_2048_screen(); break;
+        case SCREEN_FLAPPY: build_flappy_screen(); break;
         case SCREEN_INVENTORY: build_inventory_screen(); break;
         case SCREEN_VOCAB: build_vocab_screen(); break;
         case SCREEN_VOCAB_BOOKS: build_vocab_books_screen(); break;
@@ -2408,6 +3269,10 @@ static void do_update_status(void)
 
 static void do_set_screen(ui_screen_t scr)
 {
+    if (s_flappy_timer) {
+        lv_timer_del(s_flappy_timer);
+        s_flappy_timer = NULL;
+    }
     if (scr != SCREEN_VOCAB_BOOKS) s_vocab_books_notice[0] = '\0';
     s_screen = scr;
     s_wifi_sel = -1;
@@ -2435,8 +3300,18 @@ static void do_set_screen(ui_screen_t scr)
     s_hand_add = NULL;
     s_hand_clear = NULL;
     s_hand_del = NULL;
+    s_flappy_board = NULL;
+    s_flappy_bird = NULL;
+    s_flappy_score = NULL;
+    s_flappy_status = NULL;
+    for (int i = 0; i < FLAPPY_PIPE_COUNT; ++i) {
+        s_flappy_pipe_top[i] = NULL;
+        s_flappy_pipe_bottom[i] = NULL;
+    }
     s_plan_value = NULL;
     s_plan_stats = NULL;
+    s_plan_edit_target = 0;
+    s_plan_notice[0] = '\0';
     s_vocab_reset_armed = false;
 
     do_draw_all();
@@ -2557,6 +3432,7 @@ static void ui_timer_cb(lv_timer_t *t)
             break;
         }
         case SCREEN_VOCAB_PLAN:
+            if (s_plan_edit_target == 0) s_plan_edit_target = vocab_get_daily_target();
             refresh_plan_labels();
             break;
         default:

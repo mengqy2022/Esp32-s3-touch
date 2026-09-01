@@ -103,9 +103,13 @@ idf.py -p COM5 flash monitor
 build_flash.bat COM5
 ```
 
+Windows 脚本会自动切换到 UTF-8 代码页；工程源码、脚本和 CSV 均按 UTF-8 保存。
+
 ## MicroSD 初始化
 
 最简单的方法：把仓库中的 `sdcard_template/` 内容复制到 SD 卡根目录。
+
+`INVENTORY.CSV` 统一使用 UTF-8，仅保留三列：`PRODUCT_NO,MODEL,QTY`。本版本模板已根据提供的 4 份立创商城对账 CSV 合并为 169 种物料、累计订购 7085 件。
 
 ```text
 /sdcard/

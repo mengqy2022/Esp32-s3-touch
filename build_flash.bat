@@ -1,4 +1,7 @@
 @echo off
+chcp 65001 >nul
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
 set PORT=%1
 if "%PORT%"=="" (
   echo Usage: build_flash.bat COM5

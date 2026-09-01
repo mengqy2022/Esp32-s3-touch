@@ -1,11 +1,2 @@
-# 嘉立创 EDA 原理图 BOM 导出示例
-# 在嘉立创EDA中：设计 → 物料清单(BOM) → 导出 → CSV
-# 文件放入 SD 卡的 BOM_OUT 文件夹，然后在设备上：
-#   主菜单 → INVENTORY → EXPORT BOM → APPLY（确认后扣减库存）
-# 设备会自动识别这些列名（中英文均可）。
-
-Designator,Quantity,Value,Name,Footprint,LCSC Part#
-R1,R2,R3,3,10k 1%,Resistor,0603,C123456
-C1,C2,2,100nF 50V,Capacitor,0603,C234567
-U1,1,ESP32-WROOM-32E,Module,Module,C567890
-R4,1,4.7k 1%,Resistor,0603,C901234
+PRODUCT_NO,MODEL,QTY
+C25803,0603WAF1003T5E,10

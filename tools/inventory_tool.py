@@ -12,7 +12,7 @@ ESP32 Inventory / SD Card File Transfer Tool
   - 导入 CSV 入库：自动识别三种格式并合并到设备库存
       1) 立创商城订单导出
       2) 嘉立创 EDA 原理图物料清单（BOM）
-      3) 标准库存格式（LCSC,NAME,SPEC,PACKAGE,QTY，列名可中英混排）
+      3) 标准库存格式（PRODUCT_NO,MODEL,QTY；兼容旧 LCSC/SPEC 列名）
 
 依赖：pip install pyserial
 运行：python inventory_tool.py
@@ -25,6 +25,13 @@ import re
 import sys
 import threading
 import tkinter as tk
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 from tkinter import filedialog, messagebox, ttk
 
 try:
@@ -40,7 +47,9 @@ RX_CHUNK = 256
 INV_FILE = "/sdcard/INVENTORY.CSV"
 
 # Device-side field limits (must match inventory.h)
-LCSC_MAX, NAME_MAX, SPEC_MAX, PKG_MAX = 32, 32, 40, 20
+PRODUCT_NO_MAX, MODEL_MAX, NAME_MAX, PKG_MAX = 24, 64, 32, 20
+# Legacy parser aliases; output is always compact PRODUCT_NO/MODEL/QTY.
+LCSC_MAX, SPEC_MAX = PRODUCT_NO_MAX, MODEL_MAX
 
 
 # ---------------------------------------------------------------------------
@@ -75,11 +84,11 @@ KW_PKG = ["package", "footprint", "封装"]
 COL_RULES = [
     ("qty", "订购数量", 4), ("qty", "quantity", 4), ("qty", "数量", 3),
     ("qty", "qty", 2), ("qty", "count", 2),
-    ("lcsc", "商品编号", 4), ("lcsc", "supplierpart", 4), ("lcsc", "供应商编号", 4),
+    ("lcsc", "product_no", 5), ("lcsc", "productno", 5), ("lcsc", "商品编号", 4), ("lcsc", "supplierpart", 4), ("lcsc", "供应商编号", 4),
     ("lcsc", "lcsc", 4), ("lcsc", "part#", 2), ("lcsc", "编号", 2),
     ("name", "商品名称", 4), ("name", "物料名称", 4), ("name", "comment", 3),
     ("name", "value", 2), ("name", "name", 2), ("name", "型号", 1), ("name", "名称", 1),
-    ("spec", "厂家型号", 4), ("spec", "制造商型号", 4), ("spec", "manufacturerpart", 4),
+    ("spec", "商品型号", 6), ("spec", "model", 5), ("spec", "厂家型号", 4), ("spec", "制造商型号", 4), ("spec", "manufacturerpart", 4),
     ("spec", "spec", 3), ("spec", "规格", 3), ("spec", "description", 2), ("spec", "描述", 2),
     ("pkg", "package", 3), ("pkg", "footprint", 3), ("pkg", "封装", 3),
 ]
@@ -170,7 +179,7 @@ def parse_lcsc_order(rows):
         name = sanitize_field(row[cols["name"]] if cols["name"] >= 0 else "", NAME_MAX)
         spec = sanitize_field(row[cols["spec"]] if cols["spec"] >= 0 else "", SPEC_MAX)
         pkg = sanitize_field(row[cols["pkg"]] if cols["pkg"] >= 0 else "", PKG_MAX)
-        items.append({"lcsc": lcsc, "name": name, "spec": spec, "pkg": pkg, "qty": qty})
+        items.append({"product_no": lcsc, "model": spec or name, "qty": qty})
     return items
 
 
@@ -199,7 +208,7 @@ def parse_eda_bom(rows):
         pkg = sanitize_field(row[cols["pkg"]] if cols["pkg"] >= 0 else "", PKG_MAX)
         if not (lcsc or name or spec):
             continue
-        items.append({"lcsc": lcsc, "name": name, "spec": spec, "pkg": pkg, "qty": qty})
+        items.append({"product_no": lcsc, "model": spec or name, "qty": qty})
     return items
 
 
@@ -225,56 +234,70 @@ def parse_standard(rows):
         pkg = sanitize_field(row[cols["pkg"]] if cols["pkg"] >= 0 else "", PKG_MAX)
         if not (lcsc or name or spec):
             continue
-        items.append({"lcsc": lcsc, "name": name, "spec": spec, "pkg": pkg, "qty": qty})
+        items.append({"product_no": lcsc, "model": spec or name, "qty": qty})
     return items
 
 
 def parse_inventory_file(raw):
-    """Parse an existing INVENTORY.CSV (device standard format) into items."""
+    """Parse compact inventory; legacy five-column files are still accepted."""
     text = decode_bytes(raw)
     reader = csv.reader(io.StringIO(text), delimiter=sniff_delimiter(text))
     rows = list(parse_rows_from_reader(reader))
-    return parse_standard(rows) if rows else []
+    if not rows:
+        return []
+    head = [norm_key(c) for c in rows[0]]
+    if "product_no" in head and "model" in head and "qty" in head:
+        pi, mi, qi = head.index("product_no"), head.index("model"), head.index("qty")
+        out = []
+        for row in rows[1:]:
+            if len(row) <= max(pi, mi, qi):
+                continue
+            out.append({"product_no": sanitize_field(row[pi], PRODUCT_NO_MAX),
+                        "model": sanitize_field(row[mi], MODEL_MAX),
+                        "qty": parse_int(row[qi])})
+        return out
+    return [_compact_item(it) for it in parse_standard(rows)]
+
+
+def _compact_item(it):
+    """Map flexible input fields to the device's compact inventory schema."""
+    product_no = sanitize_field(it.get("product_no") or it.get("lcsc", ""), PRODUCT_NO_MAX)
+    model = sanitize_field(it.get("model") or it.get("spec") or it.get("name", ""), MODEL_MAX)
+    return {"product_no": product_no, "model": model, "qty": int(it.get("qty", 0))}
 
 
 def items_to_csv_bytes(items):
-    """Serialize items to device INVENTORY.CSV format (fields must not contain commas)."""
+    """Serialize UTF-8 PRODUCT_NO,MODEL,QTY only."""
     out = io.StringIO()
-    out.write("LCSC,NAME,SPEC,PACKAGE,QTY\n")
-    for it in items:
-        out.write("{},{},{},{},{}\n".format(
-            sanitize_field(it.get("lcsc", ""), LCSC_MAX),
-            sanitize_field(it.get("name", ""), NAME_MAX),
-            sanitize_field(it.get("spec", ""), SPEC_MAX),
-            sanitize_field(it.get("pkg", ""), PKG_MAX),
-            int(it.get("qty", 0))))
+    out.write("PRODUCT_NO,MODEL,QTY\n")
+    for raw in items:
+        it = _compact_item(raw)
+        out.write("{},{},{}\n".format(it["product_no"], it["model"], it["qty"]))
     return out.getvalue().encode("utf-8")
 
 
 def merge_inventory(existing, new_items):
-    """Merge new items into existing list; same LCSC (or name+spec+pkg) sums qty."""
-    merged = list(existing)
-
-    def find_existing(it):
-        lcsc = norm_key(it.get("lcsc", ""))
-        for i, e in enumerate(merged):
-            if lcsc and norm_key(e.get("lcsc", "")) == lcsc:
-                return i
-        # fallback: name+spec+pkg
-        if it.get("name"):
+    """Merge by product number first, then exact model; quantities are summed."""
+    merged = [_compact_item(it) for it in existing]
+    for raw in new_items:
+        it = _compact_item(raw)
+        idx = -1
+        pno = norm_key(it["product_no"])
+        if pno:
             for i, e in enumerate(merged):
-                if (norm_key(e.get("name", "")) == norm_key(it.get("name", "")) and
-                        norm_key(e.get("spec", "")) == norm_key(it.get("spec", "")) and
-                        norm_key(e.get("pkg", "")) == norm_key(it.get("pkg", ""))):
-                    return i
-        return -1
-
-    for it in new_items:
-        idx = find_existing(it)
+                if norm_key(e["product_no"]) == pno:
+                    idx = i
+                    break
+        if idx < 0 and not pno and it["model"]:
+            mk = norm_key(it["model"])
+            for i, e in enumerate(merged):
+                if norm_key(e["model"]) == mk:
+                    idx = i
+                    break
         if idx >= 0:
-            merged[idx]["qty"] = merged[idx].get("qty", 0) + it.get("qty", 0)
-        else:
-            merged.append(dict(it))
+            merged[idx]["qty"] += it["qty"]
+        elif it["product_no"] or it["model"]:
+            merged.append(it)
     return merged
 
 
@@ -636,7 +659,7 @@ class App:
                                    "最后一次确认：\n\n真的要把库存清零吗？\n(设备端显示将变为空库存)"):
             return
         self.set_status("正在清空库存 ...")
-        header_only = b"LCSC,NAME,SPEC,PACKAGE,QTY\n"
+        header_only = b"PRODUCT_NO,MODEL,QTY\n"
         ok, msg = self.link.put(INV_FILE, header_only)
         if ok:
             self.set_status("库存已清空（仅保留表头）")
@@ -662,8 +685,7 @@ class App:
         self.log_local(f"文件格式识别: {fmt_name}，解析到 {len(new_items)} 种物料")
 
         merged = merge_inventory(existing, new_items)
-        preview = [f"{it.get('lcsc','') or '-'} | {it.get('name','')} | "
-                   f"{it.get('spec','')} | {it.get('pkg','')} | x{it.get('qty',0)}"
+        preview = [f"{_compact_item(it)['product_no'] or '-'} | {_compact_item(it)['model']} | x{_compact_item(it)['qty']}"
                    for it in new_items[:12]]
         more = "" if len(new_items) <= 12 else f"\n... 共 {len(new_items)} 条"
         summary = (f"识别格式: {fmt_name}\n"
@@ -728,16 +750,17 @@ class App:
         if ok and data:
             text = data.decode("utf-8", "replace")
             if not text.strip():
-                text = "DATETIME,ACTION,SPEC,LCSC,QTY\n"
+                text = "DATETIME,ACTION,MODEL,PRODUCT_NO,QTY\n"
             elif not text.lstrip().startswith("DATETIME"):
-                text = "DATETIME,ACTION,SPEC,LCSC,QTY\n" + text
+                text = "DATETIME,ACTION,MODEL,PRODUCT_NO,QTY\n" + text
         else:
-            text = "DATETIME,ACTION,SPEC,LCSC,QTY\n"
+            text = "DATETIME,ACTION,MODEL,PRODUCT_NO,QTY\n"
         stamp = _t.strftime("%Y-%m-%d %H:%M:%S")
         for it in items:
-            spec = (it.get("spec") or "").replace(",", " ").replace("\n", " ")
-            lcsc = (it.get("lcsc") or "").replace(",", " ").replace("\n", " ")
-            text += f"{stamp},{action},{spec},{lcsc},{int(it.get('qty',0))}\n"
+            ci = _compact_item(it)
+            model = ci["model"].replace(",", " ").replace("\n", " ")
+            product_no = ci["product_no"].replace(",", " ").replace("\n", " ")
+            text += f"{stamp},{action},{model},{product_no},{ci['qty']}\n"
         self.link.put(HIST, text.encode("utf-8"))
         self.log_local(f"已记录 {len(items)} 条{action}历史 -> {HIST}")
 
@@ -762,16 +785,15 @@ class App:
         negative = []
         for it in items:
             idx = -1
-            lcsc = norm_key(it.get("lcsc", ""))
+            ci = _compact_item(it)
+            lcsc = norm_key(ci.get("product_no", ""))
             for i, e in enumerate(after):
-                if lcsc and norm_key(e.get("lcsc", "")) == lcsc:
+                if lcsc and norm_key(_compact_item(e).get("product_no", "")) == lcsc:
                     idx = i
                     break
-            if idx < 0 and it.get("name"):
+            if idx < 0 and not lcsc and ci.get("model"):
                 for i, e in enumerate(after):
-                    if (norm_key(e.get("name", "")) == norm_key(it.get("name", "")) and
-                            norm_key(e.get("spec", "")) == norm_key(it.get("spec", "")) and
-                            norm_key(e.get("pkg", "")) == norm_key(it.get("pkg", ""))):
+                    if norm_key(_compact_item(e).get("model", "")) == norm_key(ci.get("model", "")):
                         idx = i
                         break
             if idx < 0:
@@ -779,10 +801,9 @@ class App:
                 continue
             after[idx]["qty"] = after[idx].get("qty", 0) - it.get("qty", 0)
             if after[idx]["qty"] < 0:
-                negative.append((after[idx]["name"] or after[idx]["lcsc"], after[idx]["qty"]))
+                negative.append((_compact_item(after[idx])["model"] or _compact_item(after[idx])["product_no"], after[idx]["qty"]))
 
-        preview = [f"{it.get('lcsc','') or '-'} | {it.get('name','')} | "
-                   f"{it.get('spec','')} | x{it.get('qty',0)}"
+        preview = [f"{_compact_item(it)['product_no'] or '-'} | {_compact_item(it)['model']} | x{_compact_item(it)['qty']}"
                    for it in items[:10]]
         more = "" if len(items) <= 10 else f"\n... 共 {len(items)} 条"
         miss = f"\n⚠ 未在库存中找到: {len(missing)} 条" if missing else ""

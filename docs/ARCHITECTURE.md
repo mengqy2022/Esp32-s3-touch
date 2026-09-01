@@ -68,7 +68,7 @@ Progress is fixed-record binary data (`.vcp`) to avoid rewriting a large JSON do
 ## 5. File ownership
 
 ```text
-/sdcard/INVENTORY.CSV           inventory module
+/sdcard/INVENTORY.CSV           inventory module (UTF-8 PRODUCT_NO,MODEL,QTY)
 /sdcard/BOM_IN/                 inventory module
 /sdcard/BOM_OUT/                inventory module
 /sdcard/STOCK_HIST.CSV          inventory module

@@ -9,20 +9,14 @@
 #include <sys/unistd.h>
 
 #include "esp_log.h"
-#include "esp_vfs_fat.h"
 
 static const char *TAG = "inv";
 
 // ---------------- CSV helpers ----------------
 
-// Parse one CSV line into up to 5 fields. Handles quoted fields and commas
-// inside quotes. Returns number of fields parsed (may be < max).
 static int csv_split(char *line, char *fields[], int max_fields)
 {
     if (!line || !fields || max_fields <= 0) return 0;
-
-    // Single-pass in-place CSV split. This avoids the old memmove-per-quote
-    // behavior (quadratic on long quoted lines) and also accepts escaped "".
     int n = 0;
     bool in_quotes = false;
     char *r = line;
@@ -40,7 +34,6 @@ static int csv_split(char *line, char *fields[], int max_fields)
             ++r;
             continue;
         }
-
         if (*r == ',' && !in_quotes && n < max_fields - 1) {
             *w++ = '\0';
             fields[n++] = start;
@@ -48,10 +41,8 @@ static int csv_split(char *line, char *fields[], int max_fields)
             ++r;
             continue;
         }
-
         *w++ = *r++;
     }
-
     *w = '\0';
     if (n < max_fields) fields[n++] = start;
     return n;
@@ -59,6 +50,12 @@ static int csv_split(char *line, char *fields[], int max_fields)
 
 static char *trim(char *s)
 {
+    if (!s) return s;
+    // UTF-8 BOM on the first cell.
+    if ((unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB &&
+        (unsigned char)s[2] == 0xBF) {
+        s += 3;
+    }
     while (*s && isspace((unsigned char)*s)) ++s;
     char *end = s + strlen(s);
     while (end > s && isspace((unsigned char)end[-1])) *--end = '\0';
@@ -71,52 +68,115 @@ static int str_icmp(const char *a, const char *b)
         int ca = tolower((unsigned char)*a);
         int cb = tolower((unsigned char)*b);
         if (ca != cb) return ca - cb;
-        ++a; ++b;
+        ++a;
+        ++b;
     }
     return tolower((unsigned char)*a) - tolower((unsigned char)*b);
 }
 
-// Does the header cell match any of the given keywords?
-static bool header_matches(const char *cell, const char *const *keywords, int n)
+static bool contains_icase_ascii(const char *haystack, const char *needle)
 {
-    char c[64];
-    snprintf(c, sizeof(c), "%s", cell);
-    char *t = trim(c);
-    for (int i = 0; i < n; ++i) {
-        if (str_icmp(t, keywords[i]) == 0) return true;
-        // Also match substring like "LCSC Part #"
-        if (strstr(t, keywords[i])) return true;
+    if (!haystack || !needle || !*needle) return false;
+    size_t n = strlen(needle);
+    for (const char *p = haystack; *p; ++p) {
+        size_t i = 0;
+        while (i < n && p[i] &&
+               tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i])) {
+            ++i;
+        }
+        if (i == n) return true;
     }
     return false;
 }
 
-typedef struct {
-    int col_qty, col_lcsc, col_name, col_spec, col_pkg;
-    bool valid;
-} bom_cols_t;
+typedef struct { const char *key; int score; } header_rule_t;
 
-static const char *KW_QTY[]   = { "qty", "quantity", "count", "数量" };
-static const char *KW_LCSC[]  = { "lcsc", "lcsc part#", "lcsc编号", "编号", "part#" };
-static const char *KW_NAME[]  = { "name", "value", "part", "型号", "名称", "comment" };
-static const char *KW_SPEC[]  = { "spec", "specification", "description", "规格", "描述" };
-static const char *KW_PKG[]   = { "package", "footprint", "封装" };
+static const header_rule_t RULE_QTY[] = {
+    {"订购数量", 100}, {"quantity", 95}, {"qty", 95}, {"数量", 80}, {"count", 60},
+};
+static const header_rule_t RULE_PRODUCT[] = {
+    {"商品编号", 100}, {"product_no", 100}, {"product no", 100}, {"lcsc", 95},
+    {"supplier part", 90}, {"供应商编号", 90}, {"part#", 60}, {"编号", 40},
+};
+static const header_rule_t RULE_MODEL[] = {
+    {"商品型号", 100}, {"manufacturer part", 98}, {"厂家型号", 98}, {"制造商型号", 98},
+    {"model", 95}, {"specification", 85}, {"spec", 80}, {"规格", 75}, {"value", 65},
+    {"商品名称", 45}, {"name", 40}, {"名称", 35},
+};
+static const header_rule_t RULE_NAME[] = {
+    {"商品名称", 100}, {"name", 80}, {"名称", 70}, {"comment", 60},
+};
 
-static bom_cols_t detect_columns(char *header_line)
+static int cell_score(const char *cell, const header_rule_t *rules, size_t count)
 {
-    bom_cols_t c = { -1, -1, -1, -1, -1, false };
-    char *fields[16];
-    int n = csv_split(header_line, fields, 16);
+    int best = -1;
+    for (size_t i = 0; i < count; ++i) {
+        const char *key = rules[i].key;
+        bool ascii = true;
+        for (const unsigned char *p = (const unsigned char *)key; *p; ++p) {
+            if (*p >= 0x80) { ascii = false; break; }
+        }
+        bool match = ascii ? contains_icase_ascii(cell, key) : (strstr(cell, key) != NULL);
+        if (match && rules[i].score > best) best = rules[i].score;
+    }
+    return best;
+}
+
+typedef struct {
+    int col_qty;
+    int col_product_no;
+    int col_model;
+    int col_name_fallback;
+    bool valid;
+} inv_cols_t;
+
+static inv_cols_t detect_columns(char *header_line)
+{
+    inv_cols_t c = {-1, -1, -1, -1, false};
+    int best_qty = -1, best_product = -1, best_model = -1, best_name = -1;
+    char *fields[32];
+    int n = csv_split(header_line, fields, 32);
     for (int i = 0; i < n; ++i) {
         char *f = trim(fields[i]);
-        if (header_matches(f, KW_QTY, 4)) c.col_qty = i;
-        if (header_matches(f, KW_LCSC, 5)) c.col_lcsc = i;
-        if (header_matches(f, KW_NAME, 6)) c.col_name = i;
-        if (header_matches(f, KW_SPEC, 5)) c.col_spec = i;
-        if (header_matches(f, KW_PKG, 3)) c.col_pkg = i;
+        int s;
+        s = cell_score(f, RULE_QTY, sizeof(RULE_QTY) / sizeof(RULE_QTY[0]));
+        if (s > best_qty) { best_qty = s; c.col_qty = i; }
+        s = cell_score(f, RULE_PRODUCT, sizeof(RULE_PRODUCT) / sizeof(RULE_PRODUCT[0]));
+        if (s > best_product) { best_product = s; c.col_product_no = i; }
+        s = cell_score(f, RULE_MODEL, sizeof(RULE_MODEL) / sizeof(RULE_MODEL[0]));
+        if (s > best_model) { best_model = s; c.col_model = i; }
+        s = cell_score(f, RULE_NAME, sizeof(RULE_NAME) / sizeof(RULE_NAME[0]));
+        if (s > best_name) { best_name = s; c.col_name_fallback = i; }
     }
-    // Need at least a qty column (or name) to be usable.
-    if (c.col_qty >= 0 && (c.col_name >= 0 || c.col_lcsc >= 0)) c.valid = true;
+    c.valid = c.col_qty >= 0 && (c.col_product_no >= 0 || c.col_model >= 0 || c.col_name_fallback >= 0);
     return c;
+}
+
+static void strip_line_end(char *line)
+{
+    char *nl = strchr(line, '\n');
+    if (nl) *nl = '\0';
+    char *cr = strchr(line, '\r');
+    if (cr) *cr = '\0';
+}
+
+static void parse_inventory_row(char *line, const inv_cols_t *cols, inv_item_t *it)
+{
+    char *fields[32];
+    int n = csv_split(line, fields, 32);
+    memset(it, 0, sizeof(*it));
+    if (cols->col_product_no >= 0 && cols->col_product_no < n) {
+        snprintf(it->product_no, sizeof(it->product_no), "%s", trim(fields[cols->col_product_no]));
+    }
+    const char *model = "";
+    if (cols->col_model >= 0 && cols->col_model < n) model = trim(fields[cols->col_model]);
+    if ((!model || !*model) && cols->col_name_fallback >= 0 && cols->col_name_fallback < n) {
+        model = trim(fields[cols->col_name_fallback]);
+    }
+    snprintf(it->model, sizeof(it->model), "%s", model ? model : "");
+    if (cols->col_qty >= 0 && cols->col_qty < n) {
+        it->qty = (int32_t)strtol(trim(fields[cols->col_qty]), NULL, 10);
+    }
 }
 
 // ---------------- Inventory file ----------------
@@ -125,17 +185,12 @@ bool inv_ensure_folders(void)
 {
     bool ok = true;
     DIR *d = opendir(INV_BOM_IN_DIR);
-    if (d) {
-        closedir(d);
-    } else if (mkdir(INV_BOM_IN_DIR, 0777) != 0) {
-        ok = false;
-    }
+    if (d) closedir(d);
+    else if (mkdir(INV_BOM_IN_DIR, 0777) != 0) ok = false;
+
     d = opendir(INV_BOM_OUT_DIR);
-    if (d) {
-        closedir(d);
-    } else if (mkdir(INV_BOM_OUT_DIR, 0777) != 0) {
-        ok = false;
-    }
+    if (d) closedir(d);
+    else if (mkdir(INV_BOM_OUT_DIR, 0777) != 0) ok = false;
     return ok;
 }
 
@@ -146,37 +201,43 @@ int inv_load(inv_db_t *db)
 
     FILE *f = fopen(INV_FILE, "r");
     if (!f) return 0;
-
-    // FATFS benefits from a larger stdio buffer when loading many rows.
     char io_buf[1024];
     (void)setvbuf(f, io_buf, _IOFBF, sizeof(io_buf));
 
-    char line[512];
-    bool first = true;
-    while (db->count < INV_MAX_ITEMS && fgets(line, sizeof(line), f)) {
-        char *nl = strchr(line, '\n');
-        if (nl) *nl = '\0';
-        char *cr = strchr(line, '\r');
-        if (cr) *cr = '\0';
-        if (line[0] == '\0') continue;
-
-        char *fields[8];
-        int n = csv_split(line, fields, 8);
-        if (first) { first = false; continue; } // header
-        if (n < 2) continue;
-
-        inv_item_t *it = &db->items[db->count];
-        memset(it, 0, sizeof(*it));
-        snprintf(it->lcsc, sizeof(it->lcsc), "%s", trim(fields[0]));
-        snprintf(it->name, sizeof(it->name), "%s", trim(fields[1]));
-        if (n > 2) snprintf(it->spec, sizeof(it->spec), "%s", trim(fields[2]));
-        if (n > 3) snprintf(it->pkg,  sizeof(it->pkg),  "%s", trim(fields[3]));
-        if (n > 4) it->qty = (int32_t)strtol(fields[4], NULL, 10);
-        db->count++;
+    char line[768];
+    inv_cols_t cols = {-1, -1, -1, -1, false};
+    int header_scan = 0;
+    while (fgets(line, sizeof(line), f)) {
+        strip_line_end(line);
+        if (!line[0]) continue;
+        if (!cols.valid) {
+            char header_copy[768];
+            snprintf(header_copy, sizeof(header_copy), "%s", line);
+            cols = detect_columns(header_copy);
+            if (!cols.valid && ++header_scan < 10) continue;
+            if (!cols.valid) break;
+            continue;
+        }
+        if (db->count >= INV_MAX_ITEMS) break;
+        inv_item_t item;
+        parse_inventory_row(line, &cols, &item);
+        if (!item.product_no[0] && !item.model[0]) continue;
+        db->items[db->count++] = item;
     }
     fclose(f);
     ESP_LOGI(TAG, "loaded %d items from %s", db->count, INV_FILE);
     return db->count;
+}
+
+static void csv_write_clean(FILE *f, const char *s)
+{
+    // Current inventory source is expected to be model/part-number text. Replace
+    // delimiters instead of creating a heavy quoted-field writer on the MCU.
+    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; ++p) {
+        unsigned char c = *p;
+        if (c == ',' || c == '"' || c == '\r' || c == '\n') fputc(' ', f);
+        else fputc(c, f);
+    }
 }
 
 bool inv_save(const inv_db_t *db)
@@ -184,111 +245,84 @@ bool inv_save(const inv_db_t *db)
     if (!db) return false;
     FILE *f = fopen(INV_FILE, "w");
     if (!f) return false;
-
-    // Reduce small FATFS writes; this materially shortens +/- quantity edits
-    // when INVENTORY.CSV contains hundreds of rows.
     char io_buf[1024];
     (void)setvbuf(f, io_buf, _IOFBF, sizeof(io_buf));
 
-    fprintf(f, "LCSC,NAME,SPEC,PACKAGE,QTY\n");
+    fprintf(f, "PRODUCT_NO,MODEL,QTY\n");
     for (int i = 0; i < db->count; ++i) {
         const inv_item_t *it = &db->items[i];
-        fprintf(f, "%s,%s,%s,%s,%ld\n",
-                it->lcsc, it->name, it->spec, it->pkg, (long)it->qty);
+        csv_write_clean(f, it->product_no);
+        fputc(',', f);
+        csv_write_clean(f, it->model);
+        fprintf(f, ",%ld\n", (long)it->qty);
     }
-    fclose(f);
-    ESP_LOGI(TAG, "saved %d items to %s", db->count, INV_FILE);
-    return true;
+    bool ok = (fclose(f) == 0);
+    ESP_LOGI(TAG, "saved %d compact items to %s", db->count, INV_FILE);
+    return ok;
 }
 
-// ---------------- BOM parsing ----------------
+// ---------------- BOM / purchase CSV parsing ----------------
 
 int inv_parse_bom(const char *path, inv_bom_line_t *lines, int max_lines)
 {
     if (!path || !lines || max_lines <= 0) return 0;
-
     FILE *f = fopen(path, "r");
     if (!f) {
         ESP_LOGW(TAG, "cannot open BOM: %s", path);
         return 0;
     }
 
-    char line[512];
-    bool first = true;
-    bom_cols_t cols = { -1, -1, -1, -1, -1, false };
+    char line[768];
+    inv_cols_t cols = {-1, -1, -1, -1, false};
+    int header_scan = 0;
     int count = 0;
 
     while (count < max_lines && fgets(line, sizeof(line), f)) {
-        char *nl = strchr(line, '\n');
-        if (nl) *nl = '\0';
-        char *cr = strchr(line, '\r');
-        if (cr) *cr = '\0';
-        if (line[0] == '\0') continue;
+        strip_line_end(line);
+        if (!line[0]) continue;
 
-        if (first) {
-            cols = detect_columns(line);
-            first = false;
+        if (!cols.valid) {
+            char header_copy[768];
+            snprintf(header_copy, sizeof(header_copy), "%s", line);
+            cols = detect_columns(header_copy);
+            header_scan++;
             if (!cols.valid) {
-                ESP_LOGW(TAG, "BOM header not recognized: %s", path);
-                fclose(f);
-                return 0;
+                if (header_scan >= 24) break;
+                continue;
             }
+            ESP_LOGI(TAG, "CSV header found after %d non-empty lines", header_scan);
             continue;
         }
 
-        char *fields[16];
-        int n = csv_split(line, fields, 16);
-        if (n <= cols.col_qty && n <= cols.col_name && n <= cols.col_lcsc) continue;
+        inv_item_t item;
+        parse_inventory_row(line, &cols, &item);
+        if (!item.product_no[0] && !item.model[0]) continue;
+        if (item.qty < 1) item.qty = 1;
 
-        inv_bom_line_t *b = &lines[count];
+        inv_bom_line_t *b = &lines[count++];
         memset(b, 0, sizeof(*b));
-
-        const char *q = (cols.col_qty >= 0 && cols.col_qty < n) ? fields[cols.col_qty] : "1";
-        b->qty = (int32_t)strtol(trim((char *)q), NULL, 10);
-        if (b->qty < 1) b->qty = 1;
-
-        if (cols.col_lcsc >= 0 && cols.col_lcsc < n)
-            snprintf(b->lcsc, sizeof(b->lcsc), "%s", trim(fields[cols.col_lcsc]));
-        if (cols.col_name >= 0 && cols.col_name < n)
-            snprintf(b->name, sizeof(b->name), "%s", trim(fields[cols.col_name]));
-        if (cols.col_spec >= 0 && cols.col_spec < n)
-            snprintf(b->spec, sizeof(b->spec), "%s", trim(fields[cols.col_spec]));
-        if (cols.col_pkg >= 0 && cols.col_pkg < n)
-            snprintf(b->pkg, sizeof(b->pkg), "%s", trim(fields[cols.col_pkg]));
-
-        // Skip pure header-like rows.
-        if (b->name[0] == '\0' && b->lcsc[0] == '\0') continue;
-        // Skip "Designator" style rows that only have designators.
-        if (str_icmp(b->name, "Designator") == 0) continue;
-
-        count++;
+        snprintf(b->product_no, sizeof(b->product_no), "%s", item.product_no);
+        snprintf(b->model, sizeof(b->model), "%s", item.model);
+        b->qty = item.qty;
     }
     fclose(f);
-    ESP_LOGI(TAG, "parsed %d lines from %s", count, path);
+    ESP_LOGI(TAG, "parsed %d compact lines from %s", count, path);
     return count;
 }
 
 int inv_find_item(const inv_db_t *db, const inv_bom_line_t *line)
 {
     if (!db || !line) return -1;
-
-    // 1) LCSC exact match (case-insensitive)
-    if (line->lcsc[0]) {
+    if (line->product_no[0]) {
         for (int i = 0; i < db->count; ++i) {
-            if (db->items[i].lcsc[0] && str_icmp(db->items[i].lcsc, line->lcsc) == 0) {
-                return i;
-            }
+            if (db->items[i].product_no[0] && str_icmp(db->items[i].product_no, line->product_no) == 0) return i;
         }
     }
-    // 2) name + spec + package match (name required)
-    if (line->name[0]) {
+    // Only fall back to MODEL when the source has no product number. Different
+    // supplier product numbers may legitimately share the same manufacturer model.
+    if (!line->product_no[0] && line->model[0]) {
         for (int i = 0; i < db->count; ++i) {
-            if (str_icmp(db->items[i].name, line->name) != 0) continue;
-            bool spec_ok = !line->spec[0] || !db->items[i].spec[0] ||
-                           str_icmp(db->items[i].spec, line->spec) == 0;
-            bool pkg_ok  = !line->pkg[0]  || !db->items[i].pkg[0]  ||
-                           str_icmp(db->items[i].pkg, line->pkg) == 0;
-            if (spec_ok && pkg_ok) return i;
+            if (db->items[i].model[0] && str_icmp(db->items[i].model, line->model) == 0) return i;
         }
     }
     return -1;
@@ -317,9 +351,8 @@ int inv_apply_bom(inv_db_t *db, const inv_bom_line_t *lines, int line_count,
     for (int i = 0; i < line_count; ++i) {
         int idx = matches[i].matched;
         if (idx < 0 || idx >= db->count) continue;
-        if (add) {
-            db->items[idx].qty += matches[i].qty;
-        } else {
+        if (add) db->items[idx].qty += matches[i].qty;
+        else {
             db->items[idx].qty -= matches[i].qty;
             if (db->items[idx].qty < 0) db->items[idx].qty = 0;
         }
@@ -328,99 +361,67 @@ int inv_apply_bom(inv_db_t *db, const inv_bom_line_t *lines, int line_count,
     return applied;
 }
 
-// ---------------- Stock history (STOCK_HIST.CSV) ----------------
+// ---------------- Stock history ----------------
 
-bool inv_hist_append(const char *stamp, const char *action, const char *spec,
-                     const char *lcsc, int32_t qty)
+bool inv_hist_append(const char *stamp, const char *action, const char *model,
+                     const char *product_no, int32_t qty)
 {
     FILE *f = fopen(INV_HIST_FILE, "a");
     if (!f) {
-        // File may not exist yet: create it with a header.
-        ESP_LOGW(TAG, "hist: append open failed, trying create");
         f = fopen(INV_HIST_FILE, "w");
-        if (!f) {
-            ESP_LOGE(TAG, "hist: cannot create %s", INV_HIST_FILE);
-            return false;
-        }
-        fprintf(f, "DATETIME,ACTION,SPEC,LCSC,QTY\n");
+        if (!f) return false;
+        fprintf(f, "DATETIME,ACTION,MODEL,PRODUCT_NO,QTY\n");
         fclose(f);
         f = fopen(INV_HIST_FILE, "a");
-        if (!f) {
-            ESP_LOGE(TAG, "hist: reopen failed");
-            return false;
-        }
+        if (!f) return false;
     }
     int rc = fprintf(f, "%s,%s,%s,%s,%ld\n",
-            stamp ? stamp : "-", action ? action : "-",
-            spec ? spec : "-", lcsc ? lcsc : "-", (long)qty);
+                     stamp ? stamp : "-", action ? action : "-",
+                     model ? model : "-", product_no ? product_no : "-", (long)qty);
     fclose(f);
-    if (rc < 0) {
-        ESP_LOGE(TAG, "hist: fprintf failed");
-        return false;
-    }
-    ESP_LOGI(TAG, "hist: appended %s %s %s x%ld", action, spec, lcsc, (long)qty);
-    return true;
+    return rc >= 0;
 }
 
 int inv_hist_load(inv_hist_t *hist, int max)
 {
     if (!hist || max <= 0) return 0;
-    memset(hist, 0, sizeof(inv_hist_t) * max);
-
+    memset(hist, 0, sizeof(inv_hist_t) * (size_t)max);
     FILE *f = fopen(INV_HIST_FILE, "r");
     if (!f) return 0;
 
-    char io_buf[1024];
+    char io_buf[768];
     (void)setvbuf(f, io_buf, _IOFBF, sizeof(io_buf));
-
     char line[256];
     bool first = true;
     int total = 0;
-
-    // Circularly retain the newest `max` valid entries. This keeps history
-    // useful even when STOCK_HIST.CSV grows well beyond the UI cache size.
     while (fgets(line, sizeof(line), f)) {
-        char *nl = strchr(line, '\n');
-        if (nl) *nl = '\0';
-        char *cr = strchr(line, '\r');
-        if (cr) *cr = '\0';
-        if (line[0] == '\0') continue;
-        if (first) { first = false; continue; } // header
-
+        strip_line_end(line);
+        if (!line[0]) continue;
+        if (first) { first = false; continue; }
         char *fields[8];
         int n = csv_split(line, fields, 8);
         if (n < 5) continue;
-
         int slot = total % max;
         inv_hist_t *h = &hist[slot];
         memset(h, 0, sizeof(*h));
         snprintf(h->stamp, sizeof(h->stamp), "%s", trim(fields[0]));
         snprintf(h->action, sizeof(h->action), "%s", trim(fields[1]));
-        snprintf(h->spec, sizeof(h->spec), "%s", trim(fields[2]));
-        snprintf(h->lcsc, sizeof(h->lcsc), "%s", trim(fields[3]));
-        h->qty = (int32_t)strtol(fields[4], NULL, 10);
+        snprintf(h->model, sizeof(h->model), "%s", trim(fields[2]));
+        snprintf(h->product_no, sizeof(h->product_no), "%s", trim(fields[3]));
+        h->qty = (int32_t)strtol(trim(fields[4]), NULL, 10);
         total++;
     }
     fclose(f);
 
     int count = total < max ? total : max;
     if (total > max && count > 1) {
-        // Ring order is [old tail ... newest ... old head]. Rotate in place
-        // through a temporary cache; callers then receive oldest->newest.
         inv_hist_t *tmp = malloc(sizeof(inv_hist_t) * (size_t)count);
         if (tmp) {
             int oldest = total % max;
-            for (int i = 0; i < count; ++i) {
-                tmp[i] = hist[(oldest + i) % max];
-            }
+            for (int i = 0; i < count; ++i) tmp[i] = hist[(oldest + i) % max];
             memcpy(hist, tmp, sizeof(inv_hist_t) * (size_t)count);
             free(tmp);
-        } else {
-            ESP_LOGW(TAG, "history: no memory to reorder newest entries");
         }
     }
-
-    ESP_LOGI(TAG, "history: %d newest entries (%d total)", count, total);
     return count;
 }
-

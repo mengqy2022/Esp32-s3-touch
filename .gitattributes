@@ -10,3 +10,8 @@
 CMakeLists.txt text eol=lf
 *.bat text eol=crlf
 *.csv text eol=lf
+
+# UTF-8 policy: all repository text is stored as UTF-8.
+*.txt text eol=lf
+*.json text eol=lf
+*.ini text eol=lf

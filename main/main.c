@@ -73,8 +73,9 @@ void sd_scan_request(void)
     ui_update_status();
     rgb_set(false, false, true); // blue while scanning
 
-    // 8192 bytes of stack for FAT mount + directory walk.
-    if (xTaskCreate(scan_task, "sd_scan", 8192, NULL, 5, NULL) != pdPASS) {
+    // Keep the scan task lean: the previous 8 KiB stack reduced the heap available
+    // to FATFS/opendir exactly when the SD probe needed it most.
+    if (xTaskCreate(scan_task, "sd_scan", 4096, NULL, 4, NULL) != pdPASS) {
         ui_set_scanning(false);
         rgb_set(true, false, false);
     }
@@ -168,6 +169,14 @@ void app_main(void)
     ESP_ERROR_CHECK(lcd_init());
     ESP_ERROR_CHECK(touch_init());
     ESP_ERROR_CHECK(sd_monitor_init());
+
+    // Mount SD before Wi-Fi/LVGL reserve most of the internal heap, then keep the
+    // healthy mount alive. A missing card remains non-fatal and can be retried.
+    esp_err_t sd_boot_err = sd_monitor_ensure_mounted();
+    if (sd_boot_err != ESP_OK) {
+        ESP_LOGW(TAG, "early SD mount deferred: %s", esp_err_to_name(sd_boot_err));
+    }
+
     wifi_mgr_init();
     net_time_init();
     ESP_ERROR_CHECK(vocab_init());

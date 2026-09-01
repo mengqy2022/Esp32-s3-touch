@@ -2,6 +2,7 @@
 #include "board_pins.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -11,6 +12,7 @@
 #include "driver/sdspi_host.h"
 #include "driver/spi_common.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 
@@ -19,6 +21,7 @@ static const char *TAG = "sdmon";
 static sdmmc_card_t *s_card;
 static sdmon_status_t s_status;
 static bool s_bus_ready;
+static unsigned s_root_fail_streak;
 
 static void clear_runtime_fields(void)
 {
@@ -83,8 +86,8 @@ esp_err_t sd_monitor_ensure_mounted(void)
 
     esp_vfs_fat_mount_config_t mount_config = {
         .format_if_mount_failed = false,
-        .max_files = 12,
-        .allocation_unit_size = 16 * 1024,
+        .max_files = 6,
+        .allocation_unit_size = 8 * 1024,
     };
 
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
@@ -109,6 +112,10 @@ esp_err_t sd_monitor_ensure_mounted(void)
     s_status.mounted = true;
     s_status.capacity_bytes = (uint64_t)s_card->csd.capacity * s_card->csd.sector_size;
     s_status.last_err = ESP_OK;
+    s_root_fail_streak = 0;
+    ESP_LOGI(TAG, "SD mounted: %u MiB, free heap=%u",
+             (unsigned)(s_status.capacity_bytes / (1024ULL * 1024ULL)),
+             (unsigned)esp_get_free_heap_size());
     return ESP_OK;
 }
 
@@ -130,14 +137,24 @@ void sd_monitor_probe(void)
         }
     }
     if (!dir) {
-        // The FAT layer can temporarily lose the root directory after card
-        // insertion/removal or SPI contention. Force a clean remount next time.
+        // opendir() allocates a DIR object. During boot Wi-Fi/LVGL can make the
+        // heap temporarily tight even though the FAT volume is mounted correctly.
+        // Do not immediately unmount on ENOMEM: doing so caused mount/unmount
+        // churn and the repeated ESP_ERR_NO_MEM loop seen in the monitor log.
+        int saved_errno = errno;
+        s_root_fail_streak++;
         s_status.state = SDMON_READ_ERROR;
-        s_status.last_err = ESP_FAIL;
-        ESP_LOGE(TAG, "root directory open failed after retry");
-        sd_monitor_unmount();
+        s_status.last_err = (saved_errno == ENOMEM) ? ESP_ERR_NO_MEM : ESP_FAIL;
+        ESP_LOGE(TAG, "root opendir failed: errno=%d (%s), heap=%u, streak=%u",
+                 saved_errno, strerror(saved_errno),
+                 (unsigned)esp_get_free_heap_size(), s_root_fail_streak);
+        if (saved_errno != ENOMEM && s_root_fail_streak >= 2) {
+            ESP_LOGW(TAG, "root read failed twice; unmounting for a clean retry");
+            sd_monitor_unmount();
+        }
         return;
     }
+    s_root_fail_streak = 0;
 
     bool got_payload = false;
     bool root_read_ok = false;

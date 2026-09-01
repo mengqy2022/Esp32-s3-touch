@@ -20,6 +20,7 @@ typedef enum {
     SCREEN_VOCAB_DICTATION, // touchscreen dictation
     SCREEN_VOCAB_PLAN,   // daily target / progress
     SCREEN_2048,          // 2048 game
+    SCREEN_FLAPPY,        // tap-to-fly pipe game
 } ui_screen_t;
 
 void ui_init(void);

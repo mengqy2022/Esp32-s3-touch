@@ -2,7 +2,7 @@
 
 ## Inventory serial tool
 
-`inventory_tool.py` manages the existing inventory/BOM workflow over the ESP32 USB serial connection. It can list, upload, download and delete SD files and merge supported inventory CSV formats.
+`inventory_tool.py` manages the existing inventory/BOM workflow over the ESP32 USB serial connection. It can list, upload, download and delete SD files and merge supported inventory CSV formats. Device output is always compact UTF-8 `PRODUCT_NO,MODEL,QTY`.
 
 Typical dependency:
 
@@ -35,3 +35,7 @@ Then copy that file to:
 `smoke_test.py` is retained for the existing serial file-transfer protocol.
 
 `test_parse.py` validates inventory CSV parsing on the PC side.
+
+## Purchase statement converter
+
+`material_to_inventory.py` converts one or more LCSC purchase CSV/ZIP files into a compact UTF-8 `INVENTORY.CSV`, merging duplicate product numbers and summing ordered quantities.
