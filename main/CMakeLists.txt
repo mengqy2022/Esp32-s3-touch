@@ -13,6 +13,7 @@ idf_component_register(
         "flappy.c"
         "inventory.c"
         "file_xfer.c"
+        "pc_monitor.c"
         "vocabulary.c"
         "font_cn16.c"
     INCLUDE_DIRS "."

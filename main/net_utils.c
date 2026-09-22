@@ -2,6 +2,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <time.h>
 
 #include "cJSON.h"
@@ -11,24 +12,113 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 static const char *TAG = "net";
 
 static bool s_time_synced;
+static net_time_src_t s_time_src = NET_TIME_SRC_NONE;
 static net_loc_t s_loc;
 static bool s_loc_dirty;
 static net_loc_state_t s_loc_state = NET_LOC_IDLE;
 
-// POSIX TZ syntax uses a reversed sign: "CST-8" means UTC+8. Keeping the
-// timezone explicit makes the daily study boundary follow the user's local day
-// instead of UTC midnight.
-#define NET_DEFAULT_TZ "CST-8"
+// Guards TZ changes (setenv/tzset) against concurrent localtime_r() calls.
+static SemaphoreHandle_t s_tz_mutex;
+
+// POSIX TZ syntax uses a reversed sign: "CST-8" means UTC+8. The default is
+// China Standard Time (UTC+8); net_tz_apply() overrides it dynamically with
+// an "UTC<sign>H[:MM]" string for any whole-minute offset.
+#define NET_DEFAULT_TZ_OFFSET_MIN 480
+#define NET_NVS_NAMESPACE "storage"
+#define NET_NVS_KEY_TZ    "tz_off_min"
+
+static int s_tz_offset_min = NET_DEFAULT_TZ_OFFSET_MIN;
+
+static int load_tz_offset_from_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NET_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        return NET_DEFAULT_TZ_OFFSET_MIN;
+    }
+    int32_t off = 0;
+    esp_err_t err = nvs_get_i32(h, NET_NVS_KEY_TZ, &off);
+    nvs_close(h);
+    if (err != ESP_OK || off < -14 * 60 || off > 14 * 60) {
+        return NET_DEFAULT_TZ_OFFSET_MIN;
+    }
+    return (int)off;
+}
+
+// Build the POSIX TZ string for a whole-minute offset east of UTC
+// (sign reversed: UTC+8 -> "UTC-8", UTC+5:30 -> "UTC-5:30", UTC0 -> "UTC0").
+static void tz_string_for(char *buf, size_t len, int offset_min)
+{
+    int a = abs(offset_min);
+    if (a == 0) {
+        snprintf(buf, len, "UTC0");
+        return;
+    }
+    char sgn = offset_min > 0 ? '-' : '+';
+    int h = a / 60, m = a % 60;
+    if (m) snprintf(buf, len, "UTC%c%d:%02d", sgn, h, m);
+    else   snprintf(buf, len, "UTC%c%d", sgn, h);
+}
+
+static void tz_apply(int offset_min)
+{
+    if (s_tz_mutex) xSemaphoreTake(s_tz_mutex, portMAX_DELAY);
+    s_tz_offset_min = offset_min;
+    char tz[32];
+    tz_string_for(tz, sizeof(tz), offset_min);
+    setenv("TZ", tz, 1);
+    tzset();
+    if (s_tz_mutex) xSemaphoreGive(s_tz_mutex);
+    ESP_LOGI(TAG, "timezone: UTC%s%d:%02d (offset %d min)",
+             offset_min > 0 ? "+" : "-",
+             abs(offset_min) / 60, abs(offset_min) % 60, offset_min);
+}
 
 void net_time_init(void)
 {
-    setenv("TZ", NET_DEFAULT_TZ, 1);
-    tzset();
+    s_tz_mutex = xSemaphoreCreateMutex();
+    s_tz_offset_min = load_tz_offset_from_nvs();
+    tz_apply(s_tz_offset_min);
+}
+
+int net_tz_offset_minutes(void)
+{
+    return s_tz_offset_min;
+}
+
+esp_err_t net_tz_apply(int offset_minutes)
+{
+    if (offset_minutes < -14 * 60 || offset_minutes > 14 * 60) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (offset_minutes == s_tz_offset_min) return ESP_OK; // no-op, skip flash write
+    nvs_handle_t h;
+    if (nvs_open(NET_NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, NET_NVS_KEY_TZ, (int32_t)offset_minutes);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    tz_apply(offset_minutes);
+    return ESP_OK;
+}
+
+// ---------------- local time accessors ----------------
+static bool lock_local_time(void)
+{
+    if (!s_tz_mutex) return false;
+    return xSemaphoreTake(s_tz_mutex, pdMS_TO_TICKS(100)) == pdTRUE;
+}
+
+static void unlock_local_time(void)
+{
+    if (s_tz_mutex) xSemaphoreGive(s_tz_mutex);
 }
 
 // ---------------- SNTP ----------------
@@ -36,6 +126,7 @@ static void sntp_time_cb(struct timeval *tv)
 {
     (void)tv;
     s_time_synced = true;
+    s_time_src = NET_TIME_SRC_WIFI;
     ESP_LOGI(TAG, "SNTP time synchronized");
 }
 
@@ -54,6 +145,24 @@ bool net_time_synced(void)
     return s_time_synced;
 }
 
+net_time_src_t net_time_source(void)
+{
+    return s_time_src;
+}
+
+void net_time_from_usb(time_t unix_time)
+{
+    // Reject obviously invalid epochs (out-of-range or long before 2020).
+    if (unix_time < 1577836800LL || unix_time > 4102444800LL) {
+        ESP_LOGW(TAG, "rejecting out-of-range PC time %lld", (long long)unix_time);
+        return;
+    }
+    struct timeval tv = { .tv_sec = unix_time, .tv_usec = 0 };
+    settimeofday(&tv, NULL);
+    s_time_synced = true;
+    s_time_src = NET_TIME_SRC_USB;
+}
+
 bool net_time_str(char *buf, size_t len)
 {
     if (!buf || len == 0) return false;
@@ -64,7 +173,9 @@ bool net_time_str(char *buf, size_t len)
     time_t now = 0;
     time(&now);
     struct tm tmv;
+    bool locked = lock_local_time();
     localtime_r(&now, &tmv);
+    if (locked) unlock_local_time();
     if (tmv.tm_year < 120) {
         snprintf(buf, len, "1970-01-01 00:00:00");
         return false;

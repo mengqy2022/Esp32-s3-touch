@@ -26,6 +26,10 @@ void lv_port_resume(void);
 // Post a UI command; executed on the LVGL task thread. Thread-safe.
 void lv_port_post_cmd(int type, int arg);
 
+// Milliseconds (esp_timer based) of the last touch press/release. Used by the
+// idle "return to clock" logic in main.c. Never decreases (boots at 0).
+uint32_t lv_port_last_input_ms(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -7,6 +7,7 @@
 #include "lcd_ili9341.h"
 #include "lv_port.h"
 #include "net_utils.h"
+#include "pc_monitor.h"
 #include "sd_monitor.h"
 #include "ui.h"
 #include "wifi_mgr.h"
@@ -24,6 +25,10 @@
 static const char *TAG = "app";
 
 #define AUTO_PERIOD_US 3000000LL
+
+// Idle "clock screen": when the MENU sits untouched this long, fall back to
+// the PC MONITOR dashboard (big clock + host telemetry). Tap it to return.
+#define IDLE_TO_PCMON_MS 120000
 
 static void rgb_init(void)
 {
@@ -193,6 +198,7 @@ void app_main(void)
 
     sd_scan_request();
     // Auto-reconnect is handled by the WIFI_EVENT_STA_START handler in wifi_mgr.
+    pc_monitor_init(); // PC telemetry + USB time sync (PC: lines on the same UART)
     file_xfer_start(); // PC serial file-transfer service (INVENTORY.CSV etc.)
 
     xTaskCreate(wifi_watch_task, "wifi_watch", 3072, NULL, 3, NULL);
@@ -206,6 +212,16 @@ void app_main(void)
             if (now - last_auto_us >= AUTO_PERIOD_US) {
                 sd_scan_request();
                 last_auto_us = now;
+            }
+        }
+        // Idle fall-back to the clock / PC monitor screen (menu only, so
+        // games and tool screens are never yanked away).
+        if (ui_get_screen() == SCREEN_MENU) {
+            uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+            if (now_ms - lv_port_last_input_ms() >= IDLE_TO_PCMON_MS) {
+                ESP_LOGI(TAG, "idle %ds: showing clock screen",
+                         (int)(IDLE_TO_PCMON_MS / 1000));
+                ui_set_screen(SCREEN_PCMON);
             }
         }
         ui_tick();

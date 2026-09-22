@@ -41,6 +41,8 @@ static void disp_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t 
 }
 
 // ---------------- Touch input ----------------
+static volatile uint32_t s_last_input_ms;
+
 static void indev_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
     (void)drv;
@@ -49,6 +51,10 @@ static void indev_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
 
     int x = 0, y = 0;
     bool pressed = touch_read_xy(&x, &y);
+
+    if (pressed || last_pressed) {
+        s_last_input_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    }
 
     if (pressed) {
         if (x < 0 || x >= LV_DISP_H_RES || y < 0 || y >= LV_DISP_V_RES) {
@@ -97,6 +103,11 @@ void lv_port_post_cmd(int type, int arg)
     if (xQueueSend(s_cmd_queue, cmd, 0) != pdTRUE) {
         ESP_LOGW(TAG, "UI command queue full; command %d dropped", type);
     }
+}
+
+uint32_t lv_port_last_input_ms(void)
+{
+    return s_last_input_ms;
 }
 
 void lv_port_suspend(void)

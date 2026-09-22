@@ -1,4 +1,5 @@
 #include "file_xfer.h"
+#include "pc_monitor.h"
 
 #include <dirent.h>
 #include <stdarg.h>
@@ -224,6 +225,9 @@ static void xfer_task(void *arg)
             } else {
                 send_line("FILE:ERR|unknown command");
             }
+        } else if (strncmp(line, "PC:", 3) == 0) {
+            // PC Monitor telemetry (time sync + CPU/GPU/MEM feed).
+            pc_monitor_handle_line(line + 3);
         }
         free(line);
     }
@@ -254,7 +258,9 @@ esp_err_t file_xfer_start(void)
         ESP_LOGE(TAG, "uart_set_pin failed: %s", esp_err_to_name(err));
         return err;
     }
-    err = uart_driver_install(XFER_UART, 512, 0, 0, NULL, 0);
+    // 1 KiB RX ring buffer: PC: telemetry keeps flowing even while a FILE:GET
+    // stream occupies the TX path.
+    err = uart_driver_install(XFER_UART, 1024, 0, 0, NULL, 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "uart_driver_install failed: %s", esp_err_to_name(err));
         return err;

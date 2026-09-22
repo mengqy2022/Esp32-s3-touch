@@ -21,6 +21,7 @@ typedef enum {
     SCREEN_VOCAB_PLAN,   // daily target / progress
     SCREEN_2048,          // 2048 game
     SCREEN_FLAPPY,        // tap-to-fly pipe game
+    SCREEN_PCMON,         // clock + PC CPU/GPU monitor dashboard
 } ui_screen_t;
 
 void ui_init(void);

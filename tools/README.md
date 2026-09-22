@@ -1,5 +1,21 @@
 # PC tools
 
+## PC Monitor host agent
+
+`pc_monitor_host.py` pushes wall-clock time + CPU/GPU/MEM telemetry to the
+device over the Type-C serial port. The device shows it on its PC MONITOR
+screen (big clock + load bars + temperatures) and syncs its clock.
+
+```bash
+pip install pyserial
+python tools/pc_monitor_host.py                 # auto-detect serial port
+python tools/pc_monitor_host.py --port COM8
+python tools/pc_monitor_host.py --list-ports
+```
+
+Windows uses ctypes (GetSystemTimes / GlobalMemoryStatusEx) and NVIDIA NVML,
+so no extra Python dependencies are needed. See `docs/PC_MONITOR_CN.md`.
+
 ## Inventory serial tool
 
 `inventory_tool.py` manages the existing inventory/BOM workflow over the ESP32 USB serial connection. It can list, upload, download and delete SD files and merge supported inventory CSV formats. Device output is always compact UTF-8 `PRODUCT_NO,MODEL,QTY`.

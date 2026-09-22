@@ -3,6 +3,7 @@
 #include "lcd_ili9341.h"
 #include "lv_port.h"
 #include "net_utils.h"
+#include "pc_monitor.h"
 #include "sd_monitor.h"
 #include "sudoku.h"
 #include "game2048.h"
@@ -73,6 +74,22 @@ static wifi_state_t s_last_wifi_state = (wifi_state_t)-1;
 // MENU bottom info labels
 static lv_obj_t *s_menu_time;
 static lv_obj_t *s_menu_loc;
+
+// Touch-calibration confirmation overlay (LVGL top layer)
+static lv_obj_t *s_cal_layer;
+
+// PC MONITOR screen widgets
+static lv_obj_t *s_pcmon_clock;
+static lv_obj_t *s_pcmon_date;
+static lv_obj_t *s_pcmon_link;
+static lv_obj_t *s_pcmon_cpu_bar;
+static lv_obj_t *s_pcmon_cpu_val;
+static lv_obj_t *s_pcmon_gpu_bar;
+static lv_obj_t *s_pcmon_gpu_val;
+static lv_obj_t *s_pcmon_mem_bar;
+static lv_obj_t *s_pcmon_mem_val;
+static lv_obj_t *s_pcmon_mem_detail;
+static lv_obj_t *s_pcmon_status;
 
 // SUDOKU state
 static sudoku_t s_sudoku;
@@ -224,6 +241,10 @@ static void dict_check_event(lv_event_t *e);
 static int hand_recognize_segments(char *out, size_t out_sz, int *avg_confidence);
 static int hand_commit_pad(bool show_feedback);
 static void plan_action_event(lv_event_t *e);
+static void show_cal_confirm(void);
+static void build_pcmon_screen(void);
+static void refresh_pcmon_screen(void);
+static void on_pcmon_tap(lv_event_t *e);
 
 // ---------------- helpers ----------------
 static void style_screen(lv_obj_t *scr)
@@ -324,6 +345,96 @@ static bool click_ok(void)
     return true;
 }
 
+// ---------------- CALIBRATE confirmation dialog ----------------
+// One-tap "CALIBRATE" used to erase the touch mapping and force a 3-point
+// recalibration with no way back - far too easy to trigger by accident. The
+// menu button now opens this confirmation dialog first.
+
+static void on_cal_scrim_click(lv_event_t *e)
+{
+    (void)e; // swallow taps on the dimmed background
+}
+
+static void on_cal_cancel(lv_event_t *e)
+{
+    (void)e;
+    if (!click_ok()) return;
+    if (s_cal_layer) {
+        lv_obj_del(s_cal_layer);
+        s_cal_layer = NULL;
+    }
+}
+
+static void on_cal_confirm(lv_event_t *e)
+{
+    (void)e;
+    if (!click_ok()) return;
+    if (s_cal_layer) {
+        lv_obj_del(s_cal_layer);
+        s_cal_layer = NULL;
+    }
+    // Re-run touch calibration: suspend LVGL first so the bare-metal
+    // LCD driver owns the SPI bus exclusively. Same flow as the old
+    // unconditional menu action - now only after explicit confirmation.
+    lv_port_suspend();
+    touch_clear_calibration();
+    touch_run_calibration();
+    lv_port_resume();
+    lv_port_post_cmd(UI_CMD_SCREEN, SCREEN_MENU);
+}
+
+static void show_cal_confirm(void)
+{
+    if (s_cal_layer) return; // already open
+
+    lv_obj_t *layer = lv_obj_create(lv_layer_top());
+    s_cal_layer = layer;
+    lv_obj_set_size(layer, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_pos(layer, 0, 0);
+    lv_obj_set_style_bg_color(layer, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(layer, LV_OPA_60, 0);
+    lv_obj_set_style_border_width(layer, 0, 0);
+    lv_obj_set_style_radius(layer, 0, 0);
+    lv_obj_set_style_pad_all(layer, 0, 0);
+    lv_obj_clear_flag(layer, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(layer, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(layer, on_cal_scrim_click, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *card = lv_obj_create(layer);
+    lv_obj_set_size(card, 280, 118);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, CLR_PANEL, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, CLR_TEXT_DIM, 0);
+    lv_obj_set_style_radius(card, 12, 0);
+    lv_obj_set_style_pad_all(card, 0, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, "TOUCH CALIBRATE?");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(title, CLR_WARN, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 12);
+
+    lv_obj_t *body = lv_label_create(card);
+    lv_label_set_text(body, "Start 3-point calibration?\nCurrent calibration will be lost.");
+    lv_obj_set_style_text_color(body, CLR_TEXT_DIM, 0);
+    lv_obj_set_style_text_align(body, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(body, LV_ALIGN_TOP_MID, 0, 40);
+
+    lv_obj_t *ok = make_btn(card, "CONFIRM", on_cal_confirm, 0);
+    lv_obj_set_size(ok, 110, 32);
+    lv_obj_set_style_bg_color(ok, CLR_WARN, 0);
+    lv_obj_set_style_bg_color(ok, CLR_PRIMARY_D, LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(lv_obj_get_child(ok, 0), lv_color_black(), 0);
+    lv_obj_align(ok, LV_ALIGN_BOTTOM_LEFT, 14, -10);
+
+    lv_obj_t *no = make_btn(card, "CANCEL", on_cal_cancel, 0);
+    lv_obj_set_size(no, 110, 32);
+    lv_obj_set_style_bg_color(no, CLR_PANEL_2, 0);
+    lv_obj_align(no, LV_ALIGN_BOTTOM_RIGHT, -14, -10);
+}
+
 static void on_menu_btn(lv_event_t *e)
 {
     // IMPORTANT: lv_event_get_user_data() returns the data registered with
@@ -337,13 +448,8 @@ static void on_menu_btn(lv_event_t *e)
         case 1: lv_port_post_cmd(UI_CMD_SCREEN, SCREEN_SYSINFO); break;
         case 2: lv_port_post_cmd(UI_CMD_SCREEN, SCREEN_WIFI); break;
         case 3: {
-            // Re-run touch calibration: suspend LVGL first so the bare-metal
-            // LCD driver owns the SPI bus exclusively.
-            lv_port_suspend();
-            touch_clear_calibration();
-            touch_run_calibration();
-            lv_port_resume();
-            lv_port_post_cmd(UI_CMD_SCREEN, SCREEN_MENU);
+            // Ask for confirmation before wiping the touch calibration.
+            show_cal_confirm();
             break;
         }
         case 4: {
@@ -373,6 +479,9 @@ static void on_menu_btn(lv_event_t *e)
         }
         case 6:
             lv_port_post_cmd(UI_CMD_SCREEN, SCREEN_VOCAB);
+            break;
+        case 9:
+            lv_port_post_cmd(UI_CMD_SCREEN, SCREEN_PCMON);
             break;
         default: break;
     }
@@ -472,6 +581,7 @@ static void build_menu_screen(void)
         { "SD CHECK",   0, lv_color_hex(0x2E86DE) },
         { "SYSTEM",     1, lv_color_hex(0x8E6CE0) },
         { "WIFI",       2, lv_color_hex(0x00C9A7) },
+        { "PC MONITOR", 9, lv_color_hex(0x0EA5E9) },
         { "CALIBRATE",  3, lv_color_hex(0xF5A623) },
         { "SUDOKU",     4, lv_color_hex(0xE0556D) },
         { "2048",       7, lv_color_hex(0xF97316) },
@@ -761,6 +871,239 @@ static void refresh_sysinfo_labels(void)
         snprintf(line, sizeof(line), "LOC: querying...");
     }
     label_set_text_if_changed(s_sys_loc, line);
+}
+
+// ---------------- PC MONITOR screen (clock + host telemetry) ----------------
+// Dashboard layout for 320x240:
+//   y 9..31   title / accent line
+//   y 36..74  big HH:MM:SS clock (montserrat 28)
+//   y 80..98  date + weekday + UTC offset + time source
+//   y 102..118  host link status
+//   y 122..218 card with CPU / GPU / MEM load bars + temperatures
+//   y 222..   hint line (tap to return)
+
+// Any tap on empty space returns to the MENU (the screen doubles as the idle
+// "clock" screen the device falls back to).
+static void on_pcmon_tap(lv_event_t *e)
+{
+    (void)e;
+    if (!click_ok()) return;
+    lv_port_post_cmd(UI_CMD_SCREEN, SCREEN_MENU);
+}
+
+static void fmt_tz_short(int offset_min, char *buf, size_t len)
+{
+    int a = offset_min < 0 ? -offset_min : offset_min;
+    int h = a / 60, m = a % 60;
+    if (m) snprintf(buf, len, "%s%d:%02d", offset_min < 0 ? "-" : "+", h, m);
+    else   snprintf(buf, len, "%s%d", offset_min < 0 ? "-" : "+", h);
+}
+
+static lv_color_t load_color(int v)
+{
+    if (v < 0)  return CLR_PANEL_2;
+    if (v >= 90) return CLR_ERR;
+    if (v >= 70) return CLR_WARN;
+    return CLR_OK;
+}
+
+static lv_obj_t *make_stat_bar(lv_obj_t *parent, lv_coord_t x, lv_coord_t y)
+{
+    lv_obj_t *bar = lv_bar_create(parent);
+    lv_bar_set_range(bar, 0, 100);
+    lv_bar_set_value(bar, 0, LV_ANIM_OFF);
+    lv_obj_set_pos(bar, x, y);
+    lv_obj_set_size(bar, 152, 14);
+    lv_obj_set_style_bg_color(bar, CLR_PANEL_2, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(bar, 7, LV_PART_MAIN);
+    lv_obj_set_style_radius(bar, 7, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_TRANSP, LV_PART_KNOB);
+    // Keep bars display-only so the tap-anywhere-to-return background catches
+    // every touch.
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    return bar;
+}
+
+// Big, high-contrast numeric value for one stat row (e.g. "42% 61°C").
+static lv_obj_t *make_stat_value(lv_obj_t *parent, lv_coord_t x, lv_coord_t y)
+{
+    lv_obj_t *val = lv_label_create(parent);
+    lv_obj_set_style_text_font(val, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(val, CLR_TEXT, 0);
+    lv_obj_set_size(val, 96, 20);
+    lv_obj_set_pos(val, x, y);
+    lv_obj_set_style_text_align(val, LV_TEXT_ALIGN_RIGHT, 0);
+    return val;
+}
+
+static void build_pcmon_screen(void)
+{
+    lv_obj_t *scr = lv_scr_act();
+    lv_obj_clean(scr);
+    style_screen(scr);
+
+    make_title(scr, "PC MONITOR");
+
+    // Tap-anywhere background (created first so every widget draws above it;
+    // labels are not clickable, so taps on them fall through to here).
+    lv_obj_t *bg = lv_obj_create(scr);
+    lv_obj_set_size(bg, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_pos(bg, 0, 0);
+    lv_obj_set_style_bg_color(bg, CLR_BG, 0);
+    lv_obj_set_style_bg_opa(bg, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(bg, 0, 0);
+    lv_obj_set_style_radius(bg, 0, 0);
+    lv_obj_set_style_pad_all(bg, 0, 0);
+    lv_obj_clear_flag(bg, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(bg, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(bg, on_pcmon_tap, LV_EVENT_CLICKED, NULL);
+
+    s_pcmon_clock = lv_label_create(scr);
+    lv_obj_set_style_text_font(s_pcmon_clock, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(s_pcmon_clock, CLR_TEXT, 0);
+    lv_obj_set_size(s_pcmon_clock, 310, 38);
+    lv_obj_set_pos(s_pcmon_clock, 5, 36);
+    lv_obj_set_style_text_align(s_pcmon_clock, LV_TEXT_ALIGN_CENTER, 0);
+
+    s_pcmon_date = lv_label_create(scr);
+    lv_obj_set_style_text_color(s_pcmon_date, CLR_TEXT_DIM, 0);
+    lv_obj_set_size(s_pcmon_date, 310, 18);
+    lv_obj_set_pos(s_pcmon_date, 5, 80);
+    lv_obj_set_style_text_align(s_pcmon_date, LV_TEXT_ALIGN_CENTER, 0);
+
+    s_pcmon_link = lv_label_create(scr);
+    lv_obj_set_style_text_color(s_pcmon_link, CLR_TEXT_DIM, 0);
+    lv_obj_set_size(s_pcmon_link, 310, 18);
+    lv_obj_set_pos(s_pcmon_link, 5, 102);
+    lv_obj_set_style_text_align(s_pcmon_link, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *card = lv_obj_create(scr);
+    lv_obj_set_size(card, 300, 96);
+    lv_obj_set_pos(card, 10, 122);
+    lv_obj_set_style_bg_color(card, CLR_PANEL, 0);
+    lv_obj_set_style_border_width(card, 0, 0);
+    lv_obj_set_style_radius(card, 8, 0);
+    lv_obj_set_style_pad_all(card, 0, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    make_label(card, "CPU", 10, 4, CLR_TEXT_DIM);
+    s_pcmon_cpu_bar = make_stat_bar(card, 46, 7);
+    s_pcmon_cpu_val = make_stat_value(card, 200, 4);
+
+    make_label(card, "GPU", 10, 34, CLR_TEXT_DIM);
+    s_pcmon_gpu_bar = make_stat_bar(card, 46, 37);
+    s_pcmon_gpu_val = make_stat_value(card, 200, 34);
+
+    make_label(card, "MEM", 10, 64, CLR_TEXT_DIM);
+    s_pcmon_mem_bar = make_stat_bar(card, 46, 67);
+    s_pcmon_mem_val = make_stat_value(card, 200, 64);
+
+    s_pcmon_mem_detail = lv_label_create(card);
+    lv_obj_set_style_text_color(s_pcmon_mem_detail, CLR_TEXT_DIM, 0);
+    lv_obj_set_style_text_font(s_pcmon_mem_detail, &lv_font_montserrat_16, 0);
+    lv_obj_set_pos(s_pcmon_mem_detail, 48, 80);
+    lv_obj_set_size(s_pcmon_mem_detail, 240, 16);
+    // Hide duplicate large MEMORY detail text. Keep the compact MEM percentage display.
+    lv_obj_add_flag(s_pcmon_mem_detail, LV_OBJ_FLAG_HIDDEN);
+
+    s_pcmon_status = lv_label_create(scr);
+    lv_obj_set_style_text_color(s_pcmon_status, CLR_TEXT_DIM, 0);
+    lv_obj_set_pos(s_pcmon_status, 5, 205);
+    lv_obj_set_size(s_pcmon_status, 310, 16);
+    lv_obj_set_style_text_align(s_pcmon_status, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *hint = lv_label_create(scr);
+    // Keep to the glyphs Montserrat actually ships (0x20-0x7F + 0xB0/0x2022):
+    // the U+00B7 middle dot is NOT in the font and would render as a box.
+    lv_label_set_text(hint, "TAP TO RETURN  |  tools/pc_monitor_host.py");
+    lv_obj_set_style_text_color(hint, CLR_TEXT_DIM, 0);
+    lv_obj_set_size(hint, 310, 18);
+    lv_obj_set_pos(hint, 5, 222);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+
+    refresh_pcmon_screen();
+}
+
+static void refresh_one_stat(lv_obj_t *bar, lv_obj_t *val, int load, int temp)
+{
+    if (!bar || !val) return;
+    lv_bar_set_value(bar, load >= 0 ? load : 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(bar, load_color(load), LV_PART_INDICATOR);
+
+    char line[32];
+    if (load >= 0 && temp >= 0) {
+        snprintf(line, sizeof(line), "%d%%  %d°C", load, temp);
+    } else if (load >= 0) {
+        snprintf(line, sizeof(line), "%d%%", load);
+    } else if (temp >= 0) {
+        snprintf(line, sizeof(line), "%d°C", temp);
+    } else {
+        snprintf(line, sizeof(line), "--");
+    }
+    label_set_text_if_changed(val, line);
+}
+
+static void refresh_pcmon_screen(void)
+{
+    if (s_screen != SCREEN_PCMON) return;
+    char buf[64];
+
+    pc_monitor_status_t st;
+    pc_monitor_get(&st);
+
+    time_t now = 0;
+    time(&now);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    if (net_time_synced() && tmv.tm_year >= 120) {
+        snprintf(buf, sizeof(buf), "%02d:%02d:%02d",
+                 tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+        label_set_text_if_changed(s_pcmon_clock, buf);
+
+        static const char *WD[7] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+        char tzs[12];
+        fmt_tz_short(net_tz_offset_minutes(), tzs, sizeof(tzs));
+        const char *src = "?";
+        net_time_src_t ts = net_time_source();
+        if (ts == NET_TIME_SRC_USB) src = "USB";
+        else if (ts == NET_TIME_SRC_WIFI) src = "WiFi";
+        snprintf(buf, sizeof(buf), "%04d-%02d-%02d %s   UTC%s   via %s",
+                 tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+                 WD[tmv.tm_wday], tzs, src);
+        label_set_text_if_changed(s_pcmon_date, buf);
+    } else {
+        label_set_text_if_changed(s_pcmon_clock, "--:--:--");
+        label_set_text_if_changed(s_pcmon_date,
+                                  "NO TIME - connect USB or WiFi");
+    }
+
+    if (st.link) {
+        snprintf(buf, sizeof(buf), "LINKED: %.20s  (%lus ago)",
+                 st.host[0] ? st.host : "PC", (unsigned long)st.last_pkt_s);
+        lv_obj_set_style_text_color(s_pcmon_link, CLR_ACCENT, 0);
+    } else if (st.have_time || st.last_pkt_s > 0) {
+        snprintf(buf, sizeof(buf), "HOST OFFLINE");
+        lv_obj_set_style_text_color(s_pcmon_link, CLR_WARN, 0);
+    } else {
+        snprintf(buf, sizeof(buf), "WAITING FOR HOST...");
+        lv_obj_set_style_text_color(s_pcmon_link, CLR_TEXT_DIM, 0);
+    }
+    label_set_text_if_changed(s_pcmon_link, buf);
+
+    refresh_one_stat(s_pcmon_cpu_bar, s_pcmon_cpu_val, st.cpu_load, st.cpu_temp);
+    refresh_one_stat(s_pcmon_gpu_bar, s_pcmon_gpu_val, st.gpu_load, st.gpu_temp);
+    refresh_one_stat(s_pcmon_mem_bar, s_pcmon_mem_val, st.mem_load, -1);
+    if (st.mem_used_mb >= 0 && st.mem_total_mb >= 0) {
+        snprintf(buf, sizeof(buf), "%d%%", st.mem_load);
+        label_set_text_if_changed(s_pcmon_mem_val, buf);
+        snprintf(buf, sizeof(buf), "MEMORY  %d MB / %d MB", st.mem_used_mb, st.mem_total_mb);
+        label_set_text_if_changed(s_pcmon_mem_detail, buf);
+    }
+
+    if (s_pcmon_status) {
+        label_set_text_if_changed(s_pcmon_status, buf);
+    }
 }
 
 // ---------------- WIFI screen ----------------
@@ -3243,6 +3586,7 @@ static void do_draw_all(void)
         case SCREEN_SUDOKU:  build_sudoku_screen(); break;
         case SCREEN_2048: build_2048_screen(); break;
         case SCREEN_FLAPPY: build_flappy_screen(); break;
+        case SCREEN_PCMON: build_pcmon_screen(); break;
         case SCREEN_INVENTORY: build_inventory_screen(); break;
         case SCREEN_VOCAB: build_vocab_screen(); break;
         case SCREEN_VOCAB_BOOKS: build_vocab_books_screen(); break;
@@ -3260,6 +3604,7 @@ static void do_update_status(void)
         case SCREEN_SYSINFO: refresh_sysinfo_labels(); break;
         case SCREEN_WIFI:    refresh_wifi_labels(); break;
         case SCREEN_MENU:    refresh_menu_bottom(); break;
+        case SCREEN_PCMON:   refresh_pcmon_screen(); break;
         case SCREEN_VOCAB:   refresh_vocab_dashboard(); break;
         case SCREEN_VOCAB_BOOKS: refresh_vocab_download_label(); break;
         case SCREEN_VOCAB_PLAN: refresh_plan_labels(); break;
@@ -3272,6 +3617,11 @@ static void do_set_screen(ui_screen_t scr)
     if (s_flappy_timer) {
         lv_timer_del(s_flappy_timer);
         s_flappy_timer = NULL;
+    }
+    // Any pending calibration-confirm overlay must not survive a screen switch.
+    if (s_cal_layer) {
+        lv_obj_del(s_cal_layer);
+        s_cal_layer = NULL;
     }
     if (scr != SCREEN_VOCAB_BOOKS) s_vocab_books_notice[0] = '\0';
     s_screen = scr;
@@ -3313,6 +3663,17 @@ static void do_set_screen(ui_screen_t scr)
     s_plan_edit_target = 0;
     s_plan_notice[0] = '\0';
     s_vocab_reset_armed = false;
+    s_pcmon_clock = NULL;
+    s_pcmon_date = NULL;
+    s_pcmon_link = NULL;
+    s_pcmon_cpu_bar = NULL;
+    s_pcmon_cpu_val = NULL;
+    s_pcmon_gpu_bar = NULL;
+    s_pcmon_gpu_val = NULL;
+    s_pcmon_mem_bar = NULL;
+    s_pcmon_mem_val = NULL;
+    s_pcmon_mem_detail = NULL;
+    s_pcmon_status = NULL;
 
     do_draw_all();
 }
@@ -3416,6 +3777,9 @@ static void ui_timer_cb(lv_timer_t *t)
             break;
         case SCREEN_MENU:
             refresh_menu_bottom();
+            break;
+        case SCREEN_PCMON:
+            refresh_pcmon_screen();
             break;
         case SCREEN_VOCAB:
             refresh_vocab_dashboard();

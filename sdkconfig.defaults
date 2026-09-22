@@ -16,6 +16,8 @@ CONFIG_LV_MEM_SIZE_KILOBYTES=48
 CONFIG_LV_USE_LOG=n
 CONFIG_LV_FONT_MONTSERRAT_14=y
 CONFIG_LV_FONT_MONTSERRAT_16=y
+# Big clock digits on the PC Monitor screen
+CONFIG_LV_FONT_MONTSERRAT_28=y
 
 # Verify HTTPS wordbook downloads with Espressif's built-in CA bundle.
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
