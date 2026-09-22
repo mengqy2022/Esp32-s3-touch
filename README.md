@@ -21,7 +21,7 @@
 ---
 
 🌏 README in
-[**中文**](https://github.com/mengqy2022/Esp32-s3-touch/README.zh-CN.md) 
+[**中文**](https://github.com/mengqy2022/Esp32-s3-touch/README.CN.md) 
 
 ## Overview
 
