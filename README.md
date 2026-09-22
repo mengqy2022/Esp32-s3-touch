@@ -20,6 +20,9 @@
 
 ---
 
+🌏 README in
+[**中文**](https://github.com/mengqy2022/Esp32-s3-touch/README.zh-CN.md) 
+
 ## Overview
 
 **ESP32 Touch Toolbox** is a complete, polished firmware for the classic
